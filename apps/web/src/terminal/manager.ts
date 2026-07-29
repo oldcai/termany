@@ -29,7 +29,9 @@ import { registerWebLinks } from "./webLinks";
  * open() to attachSession(), once the host is mounted.
  */
 
-const WS_URL = import.meta.env.VITE_PTY_URL ?? "ws://localhost:5174";
+// 127.0.0.1 rather than `localhost` — the server's primary bind is IPv4
+// loopback and the [::1] listener is best-effort. See api.ts.
+const WS_URL = import.meta.env.VITE_PTY_URL ?? "ws://127.0.0.1:5174";
 
 export interface Session {
   el: HTMLDivElement;

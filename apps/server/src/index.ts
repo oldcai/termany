@@ -7,7 +7,7 @@ setGlobalDispatcher(new EnvHttpProxyAgent());
 import { spawn } from "node-pty";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
-import { createServer, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -26,6 +26,7 @@ import {
   setAcpConfigOption,
   type AcpRuntimeTarget,
 } from "./acpRuntime.js";
+import { guard, logRejection, resolveAllowedOrigins, resolveBindHost } from "./security.js";
 import { sessionListeningPorts } from "./sessionPorts.js";
 import { KillError, killProcess, readSystemStats } from "./systemStats.js";
 import { listSshConnections, listSshProfiles, saveSshProfileFromTarget, saveSshProfiles, sshArgsForConnection, testSshProfile } from "./ssh.js";
@@ -143,6 +144,15 @@ function mediaTypeForPath(filePath: string): string | null {
 // `npm_lifecycle_event` is "dev" only when launched via the `dev` script.
 const DEFAULT_PORT = process.env.npm_lifecycle_event === "dev" ? 5175 : 5174;
 const PORT = Number(process.env.TERMANY_PORT ?? DEFAULT_PORT);
+/**
+ * Loopback by default. This server hosts a PTY, `/api/fs/*` and every pane's
+ * scrollback with no authentication, so it has no business being reachable
+ * from the LAN. TERMANY_BIND keeps the documented remote-server workflow
+ * (VITE_PTY_URL pointed at another box) available to anyone who opts in.
+ */
+const BIND_HOST = resolveBindHost();
+const ALLOWED_ORIGINS = resolveAllowedOrigins();
+const GUARD_CONFIG = { bindHost: BIND_HOST, allowedOrigins: ALLOWED_ORIGINS };
 /**
  * Baked in at bundle time by scripts/bundle-server.mjs (esbuild --define) so a
  * packaged server can report which build it belongs to. The desktop app rejects
@@ -522,8 +532,26 @@ setInterval(flushScroll, 10_000).unref();
 
 // One HTTP server hosts both the WebSocket upgrade (PTY sessions) and a small
 // JSON API (POST /api/theme — AI theme generation, key stays server-side).
-const http = createServer((req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+const requestHandler = (req: IncomingMessage, res: ServerResponse) => {
+  // Before anything else: this server has no authentication, so a page the
+  // user merely visited must never reach a handler. CORS headers cannot do
+  // that job — a simple request executes whether or not the browser is
+  // allowed to read the reply. See security.ts.
+  const verdict = guard(req.headers, GUARD_CONFIG);
+  if (!verdict.ok) {
+    logRejection(verdict, req.url ?? "/");
+    res.writeHead(403, { "Content-Type": "text/plain" }).end("forbidden\n");
+    return;
+  }
+
+  // Echo, never `*`: a wildcard would hand every response body to any origin
+  // that gets past the guard, and it is incompatible with credentials if this
+  // ever grows them.
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Image-Type");
 
@@ -1325,7 +1353,22 @@ const http = createServer((req, res) => {
   }
 
   res.writeHead(404).end();
-});
+};
+
+const http = createServer(requestHandler);
+
+/**
+ * Loopback has two addresses, and callers disagree about which one `localhost`
+ * means: macOS resolves it to ::1 first, while the Rust shell dials 127.0.0.1
+ * explicitly (lib.rs server_get). Binding only one turns the other into a bare
+ * ECONNREFUSED with nothing to point at, so serve both.
+ *
+ * Best-effort — a host with IPv6 disabled simply doesn't get the second one,
+ * and an explicit TERMANY_BIND means the operator has chosen the interface
+ * themselves and we must not quietly add another.
+ */
+const SECONDARY_BIND = process.env.TERMANY_BIND?.trim() ? null : "::1";
+const httpSecondary = SECONDARY_BIND ? createServer(requestHandler) : null;
 
 // A stale server (e.g. one this app is about to replace after a self-update)
 // may not have released the port yet by the time we try to bind it — retry
@@ -1336,8 +1379,29 @@ let listenAttempts = 0;
 
 function tryListen(): void {
   listenAttempts++;
-  http.listen(PORT, () => {
-    console.log(`[termany] PTY server listening on ws://localhost:${PORT}  (shell: ${SHELL})`);
+  http.listen(PORT, BIND_HOST, () => {
+    console.log(
+      `[termany] PTY server listening on ws://${BIND_HOST}:${PORT}  (shell: ${SHELL})`
+    );
+    // Only once the primary is up, so an EADDRINUSE retry doesn't race two
+    // half-bound listeners against the stale server.
+    if (httpSecondary && SECONDARY_BIND) {
+      httpSecondary.on("error", (err: NodeJS.ErrnoException) => {
+        // Never fatal: the primary loopback address is already serving.
+        console.warn(
+          `[termany] could not also listen on [${SECONDARY_BIND}]:${PORT} (${err.code ?? err.message}) — ` +
+            `clients that resolve localhost to IPv6 should use 127.0.0.1`
+        );
+      });
+      httpSecondary.on("upgrade", (req, socket, head) => {
+        // wss owns the primary server's upgrades; forward the secondary's by
+        // hand. handleUpgrade still runs verifyClient, so the guard applies.
+        wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+      });
+      httpSecondary.listen(PORT, SECONDARY_BIND, () => {
+        console.log(`[termany] also listening on ws://[${SECONDARY_BIND}]:${PORT}`);
+      });
+    }
     warmAgentSessionCache();
   });
 }
@@ -1357,7 +1421,21 @@ http.on("error", (err: NodeJS.ErrnoException) => {
   throw err;
 });
 
-const wss = new WebSocketServer({ server: http });
+// A WebSocket upgrade is NOT subject to CORS — a hostile page can open one to
+// any origin and read every frame. So the same guard has to run here, and it
+// has to run before the handshake is accepted rather than after.
+const wss = new WebSocketServer({
+  server: http,
+  verifyClient: ({ req }, done) => {
+    const verdict = guard(req.headers, GUARD_CONFIG);
+    if (verdict.ok) {
+      done(true);
+      return;
+    }
+    logRejection(verdict, req.url ?? "/");
+    done(false, 403, "forbidden");
+  },
+});
 
 let connCount = 0;
 

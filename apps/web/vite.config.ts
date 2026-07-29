@@ -19,7 +19,7 @@ export default defineConfig(({ command }) => ({
   // (e.g. pointing dev at a remote box) still wins.
   define:
     command === "serve" && !process.env.VITE_PTY_URL
-      ? { "import.meta.env.VITE_PTY_URL": JSON.stringify("ws://localhost:5175") }
+      ? { "import.meta.env.VITE_PTY_URL": JSON.stringify("ws://127.0.0.1:5175") }
       : {},
   server: {
     port: 15173,
