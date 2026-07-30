@@ -21,7 +21,20 @@
  * Kept a pure function of headers + config so it is testable without a socket.
  */
 
-/** Origins the app itself legitimately runs under. */
+/**
+ * Origins the app itself legitimately runs under.
+ *
+ * MEASURED, not inferred (2026-07-30, macOS 15 / WKWebView): a packaged build
+ * serving from the custom protocol sends exactly `Origin: tauri://localhost`,
+ * and a full app start produced zero blocked requests. Worth stating because
+ * the serialisation of a custom-scheme origin is engine-dependent and some
+ * WebKit builds report `null` — if that ever shows up, `TERMANY_LOG_ORIGINS=1`
+ * prints each distinct value seen. Do NOT "fix" it by allowlisting `null`: a
+ * sandboxed cross-site iframe sends that too.
+ *
+ * Windows/Linux forms are from tauri_protocol_url (tauri/src/manager/mod.rs),
+ * not measured here.
+ */
 function defaultOrigins(vitePort: number): string[] {
   return [
     // Packaged Tauri, macOS + Linux.
@@ -145,6 +158,24 @@ export function resolveBindHost(env: NodeJS.ProcessEnv = process.env): string {
 // bury everything else in the log, and the interesting signal is the set of
 // values seen, not the count.
 const reported = new Set<string>();
+
+/**
+ * Log each distinct Origin seen, once. Off unless TERMANY_LOG_ORIGINS=1.
+ *
+ * The allowlist has to name origins that are produced by the packaged
+ * webview's engine, and those are engine- and version-dependent — some WebKit
+ * builds report `null` for a custom scheme. When a build starts 403ing itself
+ * this is the first thing you want, and guessing from the outside is slow.
+ */
+const seenOrigins = new Set<string>();
+
+export function logOrigin(origin: string | undefined, env: NodeJS.ProcessEnv = process.env): void {
+  if (env.TERMANY_LOG_ORIGINS !== "1") return;
+  const value = origin ?? "(absent)";
+  if (seenOrigins.has(value)) return;
+  seenOrigins.add(value);
+  console.log(`[termany] saw Origin: ${value}`);
+}
 
 export function logRejection(verdict: GuardVerdict, path: string): void {
   const key = `${verdict.reason}:${verdict.detail}`;

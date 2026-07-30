@@ -6,6 +6,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{Emitter, Manager};
 
+/// Native child webviews behind a "web" pane: creation (so we can attach an
+/// initialization script), evaluation, and lifecycle.
+mod web_pane;
+
 #[cfg(target_os = "macos")]
 mod macos_services {
     use std::cell::OnceCell;
@@ -530,6 +534,9 @@ fn stop_server(app: tauri::AppHandle) {
     kill_server(&app);
 }
 
+/// Superseded by `web_pane::web_pane_history`, which adds a caller check and a
+/// stricter label test. Kept for one release so a renderer bundle built before
+/// the switch keeps working — dev runs the two independently.
 #[tauri::command]
 fn webview_history(app: tauri::AppHandle, label: String, direction: String) -> Result<(), String> {
     if !label.starts_with("web_") {
@@ -823,6 +830,15 @@ pub fn run() {
             stop_server,
             frontend_ready_for_open_paths,
             webview_history,
+            web_pane::web_pane_create,
+            web_pane::web_pane_eval,
+            web_pane::web_pane_drain,
+            web_pane::web_pane_status,
+            web_pane::web_pane_close,
+            web_pane::web_pane_navigate,
+            web_pane::web_pane_reload,
+            web_pane::web_pane_devtools,
+            web_pane::web_pane_history,
             confirm_quit,
             get_window_toggle_shortcut,
             set_window_toggle_shortcut
@@ -860,6 +876,10 @@ pub fn run() {
                 frontend_ready: false,
             })));
             app.manage(QuitState(AtomicBool::new(false)));
+            app.manage(web_pane::State::default());
+            if std::env::var("TERMANY_WEB_PANE_SELFTEST").is_ok_and(|v| v == "1") {
+                web_pane::selftest::run(app.handle().clone());
+            }
             #[cfg(target_os = "macos")]
             macos_services::install(app.handle().clone());
             #[cfg(target_os = "windows")]

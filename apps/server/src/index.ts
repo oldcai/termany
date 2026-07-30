@@ -26,8 +26,21 @@ import {
   setAcpConfigOption,
   type AcpRuntimeTarget,
 } from "./acpRuntime.js";
-import { guard, logRejection, resolveAllowedOrigins, resolveBindHost } from "./security.js";
+import {
+  guard,
+  logOrigin,
+  logRejection,
+  resolveAllowedOrigins,
+  resolveBindHost,
+} from "./security.js";
 import { sessionListeningPorts } from "./sessionPorts.js";
+import {
+  clearWebEvents,
+  listWebInspectPanes,
+  pruneWebInspect,
+  readWebEvents,
+  recordWebEvents,
+} from "./webInspect.js";
 import { KillError, killProcess, readSystemStats } from "./systemStats.js";
 import { listSshConnections, listSshProfiles, saveSshProfileFromTarget, saveSshProfiles, sshArgsForConnection, testSshProfile } from "./ssh.js";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -530,6 +543,10 @@ function flushScroll(): void {
 
 setInterval(flushScroll, 10_000).unref();
 
+// Pane ids never repeat, so idle rings would accumulate one entry per web pane
+// ever opened for the life of the process.
+setInterval(() => pruneWebInspect(), 10 * 60_000).unref();
+
 // One HTTP server hosts both the WebSocket upgrade (PTY sessions) and a small
 // JSON API (POST /api/theme — AI theme generation, key stays server-side).
 const requestHandler = (req: IncomingMessage, res: ServerResponse) => {
@@ -537,6 +554,7 @@ const requestHandler = (req: IncomingMessage, res: ServerResponse) => {
   // user merely visited must never reach a handler. CORS headers cannot do
   // that job — a simple request executes whether or not the browser is
   // allowed to read the reply. See security.ts.
+  logOrigin(req.headers.origin);
   const verdict = guard(req.headers, GUARD_CONFIG);
   if (!verdict.ok) {
     logRejection(verdict, req.url ?? "/");
@@ -552,7 +570,7 @@ const requestHandler = (req: IncomingMessage, res: ServerResponse) => {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Image-Type");
 
   if (req.method === "OPTIONS") {
@@ -576,6 +594,49 @@ const requestHandler = (req: IncomingMessage, res: ServerResponse) => {
   // relying on a fragile sequence of individual transitions.
   if (req.method === "GET" && reqUrl.pathname === "/api/activity") {
     json(200, activityPayload());
+    return;
+  }
+
+  // Console/network history for web panes. The renderer drains the page-side
+  // ring into here (see webInspect.ts for why it is server-owned).
+  if (req.method === "POST" && reqUrl.pathname === "/api/web/events") {
+    readJson(req)
+      .then((body) => {
+        const paneId = String(body?.paneId ?? "");
+        if (!paneId) throw new Error("paneId is required");
+        json(200, recordWebEvents({ ...body, paneId }));
+      })
+      .catch(fail);
+    return;
+  }
+  if (req.method === "GET" && reqUrl.pathname === "/api/web/events") {
+    const paneId = reqUrl.searchParams.get("pane");
+    if (!paneId) {
+      json(400, { error: "pane is required" });
+      return;
+    }
+    json(
+      200,
+      readWebEvents(paneId, {
+        since: Number(reqUrl.searchParams.get("since") ?? 0),
+        limit: Number(reqUrl.searchParams.get("limit") ?? 200),
+        navOnly: reqUrl.searchParams.get("navOnly") === "1",
+      })
+    );
+    return;
+  }
+  if (req.method === "DELETE" && reqUrl.pathname === "/api/web/events") {
+    const paneId = reqUrl.searchParams.get("pane");
+    if (!paneId) {
+      json(400, { error: "pane is required" });
+      return;
+    }
+    clearWebEvents(paneId);
+    json(200, { cleared: true });
+    return;
+  }
+  if (req.method === "GET" && reqUrl.pathname === "/api/web/panes") {
+    json(200, { panes: listWebInspectPanes() });
     return;
   }
   if (req.method === "GET" && reqUrl.pathname === "/api/activity/events") {
@@ -1427,6 +1488,7 @@ http.on("error", (err: NodeJS.ErrnoException) => {
 const wss = new WebSocketServer({
   server: http,
   verifyClient: ({ req }, done) => {
+    logOrigin(req.headers.origin);
     const verdict = guard(req.headers, GUARD_CONFIG);
     if (verdict.ok) {
       done(true);

@@ -4,6 +4,7 @@
  * restyle the whole app at once.
  */
 import {
+  Bug,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -240,6 +241,11 @@ export function FileEntryIcon() {
 /** Refresh the current directory listing. */
 export function RefreshIcon() {
   return <RotateCw {...base} />;
+}
+
+/** Open a web pane's own Web Inspector. */
+export function InspectIcon() {
+  return <Bug {...base} />;
 }
 
 /** Restore the rows that were expanded before a collapse-all. */

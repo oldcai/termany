@@ -2917,6 +2917,41 @@ html.tauri #root {
   opacity: 0.35;
   cursor: default;
 }
+/* Error / failed-request counts for a web pane. Appears only when there is
+   something to report, so the toolbar stays quiet on a healthy page. */
+.web-badge {
+  height: 18px;
+  min-width: 18px;
+  flex: 0 0 auto;
+  padding: 0 5px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 9px;
+  background: var(--bg-3);
+  color: var(--fg-dim);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  cursor: pointer;
+}
+.web-badge:hover {
+  border-color: var(--border);
+  color: var(--fg);
+}
+.web-badge.error {
+  background: color-mix(in srgb, var(--danger, #dc5b5b) 18%, transparent);
+  color: var(--danger, #dc5b5b);
+}
+.web-badge.warn {
+  background: color-mix(in srgb, var(--warning, #c58a24) 18%, transparent);
+  color: var(--warning, #c58a24);
+}
+.web-badge.net {
+  background: color-mix(in srgb, var(--danger, #dc5b5b) 12%, transparent);
+  color: var(--danger, #dc5b5b);
+}
 .web-address {
   flex: 1;
   min-width: 0;
