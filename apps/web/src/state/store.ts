@@ -7,6 +7,39 @@ import {
 } from "../keybindings";
 import { disposePaneSessions } from "../terminal/manager";
 import { applyTheme, loadThemeId, THEMES } from "../themes";
+import {
+  type AgentMessage,
+  cwdChain,
+  type DropEdge,
+  findLeaf,
+  findTabContaining,
+  type HTab,
+  leafIds,
+  mapLeaf,
+  type Pane,
+  type PaneLocation,
+  type PaneView,
+  removeTab,
+  type TreeNode,
+  updateTabContaining,
+  type Workspace,
+} from "./paneTree";
+
+// The layout model itself lives in ./paneTree (no DOM, no localStorage, so it
+// can be tested directly). Re-exported here because this module has always been
+// where the rest of the app imports these from.
+export type {
+  AgentMessage,
+  AgentPart,
+  DropEdge,
+  HTab,
+  Pane,
+  PaneLocation,
+  PaneView,
+  TreeNode,
+  Workspace,
+} from "./paneTree";
+export { findLeaf, leafIds } from "./paneTree";
 
 /**
  * Notion-style model:
@@ -22,139 +55,11 @@ import { applyTheme, loadThemeId, THEMES } from "../themes";
  */
 
 /**
- * A pane layout inside a tab: either a single terminal (leaf) or a row/col split
- * of child panes. `dir: "row"` = side by side (vertical divider, ⌘D);
- * `dir: "col"` = stacked top/bottom (horizontal divider, ⌘⇧D).
- *
- * A leaf's `id` is the terminal session id in the registry.
- */
-export type PaneView = "terminal" | "files" | "git" | "agent" | "web" | "monitor";
-
-/** One slice of a reply, in arrival order: prose or a tool invocation.
- *  `status` is the ACP tool-call status: pending | in_progress | completed | failed.
- *  `input`/`output` are display-ready detail strings (command / result),
- *  revealed when the tool row is expanded. */
-export type AgentPart =
-  | { kind: "text"; text: string }
-  | { kind: "tool"; id: string; title: string; status?: string; input?: string; output?: string };
-
-export interface AgentMessage {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  createdAt: number;
-  /** The reply interleaved with the tool calls that produced it (ACP runtimes).
-   *  Only present when at least one tool ran; `content` stays the full text. */
-  parts?: AgentPart[];
-  /** Wall-clock run time, shown on the collapsed tool-call header. */
-  durationMs?: number;
-  /** Why the reply stopped, rendered in place of (or after) the content. */
-  error?: string;
-}
-
-export type Pane =
-  | {
-      kind: "leaf";
-      id: string;
-      title: string;
-      view?: PaneView;
-      /** Directory anchor: the pane whose directory this leaf resolves its
-       *  own from while it has no shell of its own — the file tree's root,
-       *  an agent's working folder and a terminal's first-spawn cwd all
-       *  follow it. Set at creation to the pane the user was coming from;
-       *  anchors form a chain that is walked at spawn (see cwdCandidates). */
-      cwdFrom?: string;
-      /** Explicit directory root requested by an external action, such as
-       *  dropping a folder/file from Finder onto this pane. */
-      filesRoot?: string;
-      /** File to preview when opening this pane in files view. */
-      filesSelected?: string;
-      /** Last URL explicitly opened in this pane's browser view. */
-      webUrl?: string;
-      /** OpenSSH destination for a remote terminal. When absent this pane runs
-       *  the local login shell. Kept in layout state so relaunch reconnects to
-       *  the same host. */
-      sshTarget?: string;
-      /** Human-readable profile name shown in the terminal header. */
-      sshLabel?: string;
-      /** Which agent CLI conversation this pane hosts, registered when the
-       *  session-history browser resumes into it — lets a later click on the
-       *  same conversation jump here instead of resuming a second copy. */
-      agentSession?: { agent: string; sessionId: string };
-      /** Native Agent-pane conversation state. Stored with the layout so a
-       *  conversation survives switching tabs and relaunching the app. */
-      agentMessages?: AgentMessage[];
-      /** "providerId/modelName"; unset follows the current default model. */
-      agentModel?: string;
-      /** ACP session selector picks (model, and whatever else the agent
-       *  offers), as agentId → configId → value. An ACP session always starts
-       *  on the agent's defaults, so these are replayed onto every session the
-       *  pane opens; keyed by agent because the value ids are the agent's own. */
-      agentConfig?: Record<string, Record<string, string>>;
-      /** Agent registry id for an ACP-backed native conversation. Undefined
-       *  means "never chosen" (the pane defaults to the first enabled
-       *  runtime); "" is an explicit Chat-mode choice (Termany's lightweight
-       *  BYOK chat endpoint). */
-      agentRuntime?: string;
-      /** Working folder the user picked explicitly for the ACP agent. Unset
-       *  inherits the source terminal's live cwd (via cwdFrom). */
-      agentCwd?: string;
-    }
-  | {
-      kind: "split";
-      dir: "row" | "col";
-      children: Pane[];
-      /**
-       * Each child's fractional size (sums to 1, length === children.length).
-       * Omitted means "evenly sized"; resizeSplit fills it in on first drag.
-       * Cleared whenever children are added/removed so it can't go stale.
-       */
-      sizes?: number[];
-    };
-
-/** Which side of a target pane a drag is dropping onto. */
-export type DropEdge = "left" | "right" | "top" | "bottom";
-
-/**
  * DataTransfer MIME for dragging a whole terminal tab onto a tree page.
  * Payload is JSON: `{ tabId, nodeId }` (the tab and the page it came from).
  * Distinct from the tree-node MIME so a page-drag and a tab-drag never collide.
  */
 export const HTAB_DRAG_MIME = "application/x-termany-htab";
-
-export interface HTab {
-  id: string;
-  title: string;
-  layout: Pane;
-  /** The focused leaf (session id) — where split/close act and keyboard goes. */
-  focused: string;
-  /** When set, only this leaf is shown, filling the tab (Wave-style magnify). */
-  maximized?: string;
-  /**
-   * Index into this tab's layout presets, advanced by retilePanes. Undefined
-   * means "hand-arranged" — the next press lands on preset 0 rather than
-   * skipping past it.
-   */
-  layoutPreset?: number;
-}
-
-export interface TreeNode {
-  id: string;
-  title: string;
-  expanded: boolean;
-  children: TreeNode[];
-  htabs: HTab[];
-  activeHTab: string;
-}
-
-export interface Workspace {
-  id: string;
-  title: string;
-  /** Emoji icon; when unset the UI falls back to the title's first letter. */
-  icon?: string;
-  roots: TreeNode[];
-  activeNode: string;
-}
 
 interface State {
   workspaces: Workspace[];
@@ -247,6 +152,13 @@ interface State {
 
   /** Split the focused pane of the active tab in the given direction. */
   splitFocused: (dir: "row" | "col") => void;
+  /**
+   * Split a named pane wherever it lives — the addressable form of
+   * splitFocused, which is now a thin wrapper over it. Returns the new pane's
+   * id, or null when the pane doesn't exist or its tab is already at
+   * MAX_PANES_PER_TAB.
+   */
+  splitPaneById: (leafId: string, dir: "row" | "col") => string | null;
   /** Close the focused pane; closes the whole tab if it was the last pane. */
   closeFocusedPane: () => void;
   setFocusedPane: (leafId: string) => void;
@@ -276,6 +188,17 @@ interface State {
   clearPathInPane: (leafId: string) => void;
   /** Split the focused pane, creating a new leaf that opens directly in `view`. */
   addPane: (view: PaneView, title?: string, cwdFrom?: string) => string | null;
+  /**
+   * Add a pane to the tab holding `hostPaneId`, wherever that tab lives — the
+   * addressable form of addPane, which is now a thin wrapper over it. Returns
+   * the new pane's id, or null if the host is unknown or its tab is full.
+   */
+  addPaneNear: (
+    hostPaneId: string,
+    view: PaneView,
+    title?: string,
+    cwdFrom?: string
+  ) => string | null;
   /** Show the pane's cached local shell or an OpenSSH destination. */
   setPaneSshTarget: (leafId: string, target?: string, label?: string) => void;
   /** Close a specific pane; closes the whole tab if it was the last pane. */
@@ -338,30 +261,8 @@ function makeHTab(n: number, cwdFrom?: string): HTab {
 
 // --- pane layout helpers ---------------------------------------------------
 
-/** Every leaf (session) id under a pane, in layout order. */
-export function leafIds(pane: Pane): string[] {
-  return pane.kind === "leaf" ? [pane.id] : pane.children.flatMap(leafIds);
-}
-
 function firstLeaf(pane: Pane): string {
   return pane.kind === "leaf" ? pane.id : firstLeaf(pane.children[0]);
-}
-
-export function findLeaf(pane: Pane, leafId: string): (Pane & { kind: "leaf" }) | undefined {
-  if (pane.kind === "leaf") return pane.id === leafId ? pane : undefined;
-  for (const c of pane.children) {
-    const hit = findLeaf(c, leafId);
-    if (hit) return hit;
-  }
-  return undefined;
-}
-
-/** Where a pane lives, in jumpToResult coordinates. */
-export interface PaneLocation {
-  workspaceId: string;
-  nodeId: string;
-  tabId: string;
-  paneId: string;
 }
 
 /**
@@ -727,44 +628,46 @@ function updateLeafEverywhere(
   return workspaces.map((workspace) => ({ ...workspace, roots: updateNodes(workspace.roots) }));
 }
 
-/** Close one leaf in the active tab; drops the whole tab if it was the last pane. */
+/**
+ * Close one leaf wherever it lives; drops the whole tab if it was the last pane
+ * in it. Addressed by pane id rather than through the active tab, so closing a
+ * pane in a backgrounded tab works — and so does a close arriving from outside
+ * the UI.
+ */
 function closeLeaf(s: State, leafId: string): Partial<State> {
-  const node = activeNode(s);
-  const htab = node?.htabs.find((h) => h.id === node.activeHTab);
-  if (!node || !htab) return {};
+  const loc = findTabContaining(s.workspaces, leafId);
+  if (!loc) return {};
   disposePaneSessions(leafId);
-  const layout = removeLeaf(htab.layout, leafId);
-  return {
-    workspaces: inActiveWs(s, (ws) => ({
+
+  const workspaces = s.workspaces.map((ws) => {
+    if (ws.id !== loc.workspaceId) return ws;
+    return {
       ...ws,
-      roots: updateNode(ws.roots, ws.activeNode, (n) => {
-        if (layout === null) {
-          const htabs = n.htabs.filter((h) => h.id !== htab.id);
-          if (htabs.length === 0) {
-            const h = makeHTab(1);
-            return { ...n, htabs: [h], activeHTab: h.id };
-          }
-          const activeHTab = n.activeHTab === htab.id ? htabs[htabs.length - 1].id : n.activeHTab;
-          return { ...n, htabs, activeHTab };
-        }
+      roots: updateNode(ws.roots, loc.nodeId, (n) => {
+        const htab = n.htabs.find((h) => h.id === loc.tabId);
+        if (!htab) return n;
+        const layout = removeLeaf(htab.layout, leafId);
+        if (layout === null) return removeTab(n, htab.id, () => makeHTab(1));
         return {
           ...n,
-          htabs: n.htabs.map((h) => {
-            if (h.id !== htab.id) return h;
-            return {
-              ...h,
-              layout,
-              focused: h.focused === leafId ? firstLeaf(layout) : h.focused,
-              maximized: h.maximized === leafId ? undefined : h.maximized,
-            };
-          }),
+          htabs: n.htabs.map((h) =>
+            h.id === htab.id
+              ? {
+                  ...h,
+                  layout,
+                  focused: h.focused === leafId ? firstLeaf(layout) : h.focused,
+                  maximized: h.maximized === leafId ? undefined : h.maximized,
+                }
+              : h
+          ),
         };
       }),
-    })),
-  };
+    };
+  });
+  return { workspaces };
 }
 
-export const useStore = create<State>((set) => ({
+export const useStore = create<State>((set, get) => ({
   workspaces: [first],
   activeWorkspace: first.id,
 
@@ -1110,25 +1013,28 @@ export const useStore = create<State>((set) => ({
       }),
     })),
 
-  splitFocused: (dir) =>
+  splitPaneById: (leafId, dir) => {
+    let created: string | null = null;
     set((s) => ({
-      workspaces: inActiveWs(s, (ws) => ({
-        ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
-          ...n,
-          htabs: n.htabs.map((h) => {
-            if (h.id !== n.activeHTab || paneCount(h.layout) >= MAX_PANES_PER_TAB) return h;
-            const leaf = makeLeaf(nextPaneTitle(h.layout), h.focused);
-            return {
-              ...h,
-              layout: splitPane(h.layout, h.focused, dir, leaf),
-              focused: leaf.id,
-              maximized: undefined,
-            };
-          }),
-        })),
-      })),
-    })),
+      workspaces: updateTabContaining(s.workspaces, leafId, (h) => {
+        if (paneCount(h.layout) >= MAX_PANES_PER_TAB) return h;
+        const leaf = makeLeaf(nextPaneTitle(h.layout), leafId);
+        created = leaf.id;
+        return {
+          ...h,
+          layout: splitPane(h.layout, leafId, dir, leaf),
+          focused: leaf.id,
+          maximized: undefined,
+        };
+      }),
+    }));
+    return created;
+  },
+
+  splitFocused: (dir) => {
+    const h = activeHtab(get());
+    if (h) get().splitPaneById(h.focused, dir);
+  },
 
   closeFocusedPane: () =>
     set((s) => {
@@ -1209,41 +1115,17 @@ export const useStore = create<State>((set) => ({
 
   renamePane: (leafId, title) =>
     set((s) => ({
-      workspaces: inActiveWs(s, (ws) => ({
-        ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
-          ...n,
-          htabs: n.htabs.map((h) => {
-            if (h.id !== n.activeHTab) return h;
-            const rename = (p: Pane): Pane =>
-              p.kind === "leaf"
-                ? p.id === leafId
-                  ? { ...p, title }
-                  : p
-                : { ...p, children: p.children.map(rename) };
-            return { ...h, layout: rename(h.layout) };
-          }),
-        })),
+      workspaces: updateTabContaining(s.workspaces, leafId, (h) => ({
+        ...h,
+        layout: mapLeaf(h.layout, leafId, (p) => ({ ...p, title })),
       })),
     })),
 
   setPaneAgentSession: (leafId, info) =>
     set((s) => ({
-      workspaces: inActiveWs(s, (ws) => ({
-        ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
-          ...n,
-          htabs: n.htabs.map((h) => {
-            if (h.id !== n.activeHTab) return h;
-            const tag = (p: Pane): Pane =>
-              p.kind === "leaf"
-                ? p.id === leafId
-                  ? { ...p, agentSession: info }
-                  : p
-                : { ...p, children: p.children.map(tag) };
-            return { ...h, layout: tag(h.layout) };
-          }),
-        })),
+      workspaces: updateTabContaining(s.workspaces, leafId, (h) => ({
+        ...h,
+        layout: mapLeaf(h.layout, leafId, (p) => ({ ...p, agentSession: info })),
       })),
     })),
 
@@ -1295,55 +1177,36 @@ export const useStore = create<State>((set) => ({
 
   togglePaneView: (leafId) =>
     set((s) => ({
-      workspaces: inActiveWs(s, (ws) => ({
-        ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
-          ...n,
-          htabs: n.htabs.map((h) => {
-            if (h.id !== n.activeHTab) return h;
-            // ⌘E cycles through the same order shown in the pane menu and rail.
-            const flip = (p: Pane): Pane =>
-              p.kind === "leaf"
-                ? p.id === leafId
-                  ? p.sshTarget
-                    ? { ...p, view: "terminal" }
-                    : {
-                        ...p,
-                        view:
-                          p.view === "files"
-                            ? "git"
-                            : p.view === "git"
-                              ? "agent"
-                              : p.view === "agent"
-                                ? "web"
-                                : p.view === "web"
-                                  ? "terminal"
-                                  : "files",
-                      }
-                  : p
-                : { ...p, children: p.children.map(flip) };
-            return { ...h, layout: flip(h.layout) };
-          }),
-        })),
+      workspaces: updateTabContaining(s.workspaces, leafId, (h) => ({
+        ...h,
+        // ⌘E cycles through the same order shown in the pane menu and rail.
+        layout: mapLeaf(h.layout, leafId, (p) =>
+          p.sshTarget
+            ? { ...p, view: "terminal" }
+            : {
+                ...p,
+                view:
+                  p.view === "files"
+                    ? "git"
+                    : p.view === "git"
+                      ? "agent"
+                      : p.view === "agent"
+                        ? "web"
+                        : p.view === "web"
+                          ? "terminal"
+                          : "files",
+              }
+        ),
       })),
     })),
 
   setPaneView: (leafId, view) =>
     set((s) => ({
-      workspaces: inActiveWs(s, (ws) => ({
-        ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
-          ...n,
-          htabs: n.htabs.map((h) => {
-            if (h.id !== n.activeHTab) return h;
-            const setView = (p: Pane): Pane =>
-              p.kind === "leaf"
-                ? p.id === leafId
-                  ? { ...p, view: p.sshTarget ? "terminal" : view }
-                  : p
-                : { ...p, children: p.children.map(setView) };
-            return { ...h, layout: setView(h.layout) };
-          }),
+      workspaces: updateTabContaining(s.workspaces, leafId, (h) => ({
+        ...h,
+        layout: mapLeaf(h.layout, leafId, (p) => ({
+          ...p,
+          view: p.sshTarget ? "terminal" : view,
         })),
       })),
     })),
@@ -1396,34 +1259,32 @@ export const useStore = create<State>((set) => ({
       })),
     })),
 
-  addPane: (view, title, cwdFrom) => {
+  addPaneNear: (hostPaneId, view, title, cwdFrom) => {
     let created: string | null = null;
     set((s) => ({
-      workspaces: inActiveWs(s, (ws) => ({
-        ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
-          ...n,
-          htabs: n.htabs.map((h) => {
-            if (h.id !== n.activeHTab || paneCount(h.layout) >= MAX_PANES_PER_TAB) return h;
-            // Anchor to the pane that was focused at creation (or an explicit
-            // source the caller names), so a directory view knows what to show
-            // and a terminal knows where to spawn.
-            const leaf = {
-              ...makeLeaf(title ?? nextPaneTitle(h.layout), cwdFrom ?? h.focused),
-              view,
-            };
-            created = leaf.id;
-            return {
-              ...h,
-              layout: tileLayout(h.layout, leaf),
-              focused: leaf.id,
-              maximized: undefined,
-            };
-          }),
-        })),
-      })),
+      workspaces: updateTabContaining(s.workspaces, hostPaneId, (h) => {
+        if (paneCount(h.layout) >= MAX_PANES_PER_TAB) return h;
+        // Anchor to the host pane (or an explicit source the caller names), so a
+        // directory view knows what to show and a terminal knows where to spawn.
+        const leaf = {
+          ...makeLeaf(title ?? nextPaneTitle(h.layout), cwdFrom ?? hostPaneId),
+          view,
+        };
+        created = leaf.id;
+        return {
+          ...h,
+          layout: tileLayout(h.layout, leaf),
+          focused: leaf.id,
+          maximized: undefined,
+        };
+      }),
     }));
     return created;
+  },
+
+  addPane: (view, title, cwdFrom) => {
+    const h = activeHtab(get());
+    return h ? get().addPaneNear(h.focused, view, title, cwdFrom) : null;
   },
 
   setPaneSshTarget: (leafId, target, label) => {
@@ -1741,15 +1602,7 @@ function findLeafGlobal(s: State, leafId: string): (Pane & { kind: "leaf" }) | u
  * candidate in turn and uses the first that resolves to a directory.
  */
 export function cwdCandidates(s: State, leafId: string): string[] {
-  const out = [leafId];
-  const seen = new Set(out);
-  let cur = findLeafGlobal(s, leafId)?.cwdFrom;
-  while (cur && !seen.has(cur) && out.length < 8) {
-    out.push(cur);
-    seen.add(cur);
-    cur = findLeafGlobal(s, cur)?.cwdFrom;
-  }
-  return out;
+  return cwdChain((id) => findLeafGlobal(s, id)?.cwdFrom, leafId);
 }
 
 export function activeHtab(s: State): HTab | undefined {

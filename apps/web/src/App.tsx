@@ -12,6 +12,8 @@ import { SideRail } from "./components/SideRail";
 import { SplitView } from "./components/SplitView";
 import { TreeSidebar } from "./components/TreeSidebar";
 import { WindowControls } from "./components/WindowControls";
+import { startControlClient, stopControlClient } from "./control/client";
+import { isDemo } from "./demo";
 import { isTauri } from "./env";
 import { ACTIONS, matchChord } from "./keybindings";
 import { activeHtab, activeNode, focusedCwdSession, leafIds, useStore } from "./state/store";
@@ -105,6 +107,17 @@ export function App() {
   // The find bar targets one pane; if focus moves elsewhere, it would be
   // searching a terminal the user is no longer looking at — close it instead.
   useEffect(() => setFindOpen(false), [focusedPane]);
+
+  // Mirror this window's panes to the server for the duration of the session, so
+  // an agent can address them by name. The socket doubles as the ownership
+  // signal: closing this window is what tells the server these panes are gone.
+  // The demo build has no server to mirror to, and probing loopback on a
+  // stranger's machine is not something a static page should be doing.
+  useEffect(() => {
+    if (isDemo) return;
+    startControlClient();
+    return stopControlClient;
+  }, []);
 
   // Panes live far below this state, so their "manage models / agents" menu
   // footers ask for a section over an event rather than a threaded-down prop.

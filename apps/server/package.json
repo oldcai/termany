@@ -6,11 +6,12 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
-    "test": "node --import tsx --test src/*.test.ts tests/*.test.ts"
+    "test": "node --import tsx --test src/*.test.ts src/paneControl/*.test.ts tests/*.test.ts"
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.2.1",
     "@anthropic-ai/sdk": "^0.106.0",
+    "@termany/core": "*",
     "node-pty": "^1.0.0",
     "undici": "^8.5.0",
     "ws": "^8.18.0"

@@ -24,6 +24,7 @@ import {
   promptAcpRuntime,
   respondAcpPermission,
   setAcpConfigOption,
+  setControlEnvProvider,
   type AcpRuntimeTarget,
 } from "./acpRuntime.js";
 import {
@@ -34,6 +35,18 @@ import {
   resolveBindHost,
 } from "./security.js";
 import { sessionListeningPorts } from "./sessionPorts.js";
+import { dispatch, type DispatchDeps, statusForError } from "./paneControl/http.js";
+import { ControlHub } from "./paneControl/hub.js";
+import {
+  controlEnvironment,
+  extractOscClaims,
+  IdentityRegistry,
+  OSC_CLAIM_REPLAY_PATTERN,
+  projectRootFor,
+  tokenFromHeaders,
+} from "./paneControl/identity.js";
+import { AuditRing } from "./paneControl/rings.js";
+import type { PaneRecord } from "./paneControl/selectors.js";
 import {
   clearWebEvents,
   listWebInspectPanes,
@@ -338,6 +351,13 @@ function sanitizeForReplay(data: string): string {
         ""
       )
       .replace(/\x1b\[[><][0-9;]*u/g, "")
+      // OSC 7717 — a pane-control identity claim. Not a terminal hazard, a
+      // security one: the sequence is how a hand-started agent proves which
+      // pane it lives in, and it's trustworthy precisely because only a real
+      // process can put it in a real PTY's output. Replaying scrollback would
+      // re-emit old claims into a stream anyone can trigger, so they must not
+      // survive into a replay. See identity.ts.
+      .replace(OSC_CLAIM_REPLAY_PATTERN, "")
   );
 }
 
@@ -444,13 +464,178 @@ function isOpen(ws: WebSocket | null): ws is WebSocket {
   return !!ws && ws.readyState === ws.OPEN;
 }
 
+// --- pane control ----------------------------------------------------------
+// Panes live in the renderer; these three are the server's side of reaching
+// them. See paneControl/hub.ts for why it needs a socket rather than just
+// knowing, and paneControl/policy.ts for what it's allowed to do once it does.
+
+const controlHub = new ControlHub();
+const controlIdentity = new IdentityRegistry();
+const controlAudit = new AuditRing();
+
+/**
+ * What agents put in `TERMANY_CONTROL_URL`. 127.0.0.1 rather than `localhost` for
+ * the same reason api.ts names it: macOS resolves `localhost` to ::1 first, and
+ * the IPv6 listener beside the primary is best-effort. An operator who set
+ * TERMANY_BIND has chosen the interface, so honour it.
+ */
+const CONTROL_BASE_URL = process.env.TERMANY_BIND?.trim()
+  ? `http://${BIND_HOST.includes(":") ? `[${BIND_HOST}]` : BIND_HOST}:${PORT}`
+  : `http://127.0.0.1:${PORT}`;
+
+/** Resolving a live shell's directory costs a subprocess on macOS (lsof), and
+ *  scoping needs it for every pane on every call. Memoise briefly. */
+const CONTROL_CWD_TTL_MS = 3_000;
+const controlCwdCache = new Map<string, { at: number; cwd: string | undefined }>();
+
+/**
+ * A pane's directory, or undefined when it genuinely has none.
+ *
+ * Deliberately NOT resolveSpawnCwd: that falls back to the home directory,
+ * which is right for "where should this new shell start" and wrong here. A pane
+ * whose directory can't be determined must come out undefined, because scoping
+ * reads that as "belongs to no project" — falling back to home would instead
+ * quietly file every such pane under one shared pseudo-project.
+ */
+async function controlCwdForPane(pane: PaneRecord): Promise<string | undefined> {
+  const now = Date.now();
+  const cached = controlCwdCache.get(pane.paneId);
+  if (cached && now - cached.at < CONTROL_CWD_TTL_MS) return cached.cwd;
+
+  // A live ACP session outranks everything *while the pane is showing it*: it is
+  // bound to one folder for its whole life, which is the folder the user picked,
+  // not wherever the anchor terminal has since `cd`ed to — and not the stale row
+  // that pane's own terminal left behind before it was switched to the agent
+  // view. A runtime outlives the view though (nothing tears it down on ⌘E, or on
+  // connecting SSH), so once the pane is back to a terminal that shell wins:
+  // otherwise the pane keeps naming the agent's checkout — or, for SSH, a local
+  // path that doesn't exist on the remote host.
+  let resolved = pane.view === "agent" ? await dirIfValid(acpRuntimeCwd(pane.paneId)) : undefined;
+
+  if (!resolved) {
+    // The pane's own shell first — for an SSH pane that's keyed by session id,
+    // not pane id — then the anchor chain the renderer walked for us.
+    const candidates = [pane.terminalSessionId ?? pane.paneId, ...(pane.cwdChain ?? [])];
+    for (const source of [...new Set(candidates)].slice(0, 8)) {
+      const pty = ptySessions.get(source)?.pty;
+      const live = await dirIfValid(pty ? await cwdForPid(pty.pid) : undefined);
+      if (live) {
+        resolved = live;
+        break;
+      }
+      const remembered = await dirIfValid(getSessionCwd(source) ?? undefined);
+      if (remembered) {
+        resolved = remembered;
+        break;
+      }
+    }
+  }
+  controlCwdCache.set(pane.paneId, { at: now, cwd: resolved });
+  if (controlCwdCache.size > 512) {
+    for (const [key, value] of controlCwdCache) {
+      if (now - value.at >= CONTROL_CWD_TTL_MS) controlCwdCache.delete(key);
+    }
+  }
+  return resolved;
+}
+
+/**
+ * The pane behind a terminal session id. They're the same string for a local
+ * shell but not for SSH, where the session is `${paneId}:ssh:${host}` (R8) —
+ * and identity is a property of the pane, not of one shell inside it.
+ */
+function paneIdOfSession(sessionId: string): string {
+  const at = sessionId.indexOf(":ssh:");
+  return at < 0 ? sessionId : sessionId.slice(0, at);
+}
+
+/** Same reasoning as the cwd cache, and the same need for a TTL: `git init` in
+ *  a pane, a fresh clone or a removed worktree changes the answer, and a
+ *  permanent memo would mis-scope every pane under it for the server's life. */
+const GIT_DIR_TTL_MS = 10_000;
+const gitDirCache = new Map<string, { at: number; found: boolean }>();
+
+function hasGitDir(dir: string): boolean {
+  const now = Date.now();
+  const cached = gitDirCache.get(dir);
+  if (cached && now - cached.at < GIT_DIR_TTL_MS) return cached.found;
+  let found = false;
+  try {
+    found = fs.existsSync(path.join(dir, ".git"));
+  } catch {
+    found = false;
+  }
+  if (gitDirCache.size > 2048) gitDirCache.clear();
+  gitDirCache.set(dir, { at: now, found });
+  return found;
+}
+
+// An ACP agent is as much "inside" its pane as a shell one, so it gets the same
+// identity — per-session, per-pane, never written to a config file (D7).
+setControlEnvProvider((paneId) =>
+  controlEnvironment(paneId, controlIdentity.tokenForPane(paneId), CONTROL_BASE_URL)
+);
+
+function controlDeps(): DispatchDeps {
+  return {
+    hub: controlHub,
+    identity: controlIdentity,
+    audit: controlAudit,
+    // Phase 4 puts this behind a Settings control. Until then it is the
+    // documented default from D9 rather than something more permissive.
+    policyMode: () => "ask",
+    cwdForPane: controlCwdForPane,
+    projectRootFor: (cwd) => projectRootFor(cwd, hasGitDir),
+    // Phase 4 owns the consent UI. Refusing until it exists is the safe
+    // direction to be wrong in: no Phase 3 method reaches this, and anything
+    // that would need it fails closed instead of silently proceeding.
+    requestConsent: async (prompt) => {
+      console.warn(`[termany] pane-control consent not implemented yet, refusing: ${prompt}`);
+      return false;
+    },
+  };
+}
+
+const OSC_CLAIM_START = "\x1b]7717;";
+
+/** Longest partial claim worth carrying between two PTY reads: the prefix, the
+ *  widest nonce the parser accepts, and a terminator. */
+const MAX_OSC_CLAIM_TAIL = 160;
+
 /** Wire a freshly spawned pty's output into its ring + whatever ws is attached. */
 function wireSession(id: string | undefined, session: PtySession): void {
+  // Whatever of a claim sequence arrived at the end of the last chunk. node-pty
+  // splits its reads wherever it likes, and a claim cut in half is one an agent
+  // would be told to retry for no reason it could see.
+  let oscTail = "";
   session.pty.onData((data) => {
     if (isOpen(session.ws)) session.ws.send(data);
     ringAppend(session.ring, data);
     if (id) activityTracker.noteOutput(id, data);
     if (IS_WIN) trackOscCwd(session.pty.pid, data);
+    // An identity claim from an agent the user started by hand. Only a process
+    // on this machine can put these bytes in a local PTY's output stream, which
+    // is the entire basis for trusting them — see paneControl/identity.ts. An
+    // SSH pane is excluded on purpose: there the bytes come from the remote
+    // host, and paneIdOfSession would bind them to the LOCAL pane, which is
+    // also why no token is injected into an SSH shell in the first place.
+    if (id && !session.sshTarget) {
+      const scan = oscTail ? oscTail + data : data;
+      if (scan.includes(OSC_CLAIM_START)) {
+        const paneId = paneIdOfSession(id);
+        for (const nonce of extractOscClaims(scan)) controlIdentity.noteOscClaim(paneId, nonce);
+      }
+      // Carry a trailing fragment only while it could still become a claim.
+      // Anything terminated has already been read, and re-scanning it would
+      // keep refreshing a nonce that is meant to expire.
+      const edge = scan.length > MAX_OSC_CLAIM_TAIL ? scan.slice(-MAX_OSC_CLAIM_TAIL) : scan;
+      const from = edge.lastIndexOf("\x1b");
+      const tail = from < 0 ? "" : edge.slice(from);
+      oscTail =
+        tail.startsWith(OSC_CLAIM_START) ? (/\x07|\x1b\\/.test(tail) ? "" : tail)
+        : OSC_CLAIM_START.startsWith(tail) ? tail
+        : "";
+    }
   });
   session.pty.onExit(({ exitCode, signal }) => {
     oscCwdByPid.delete(session.pty.pid);
@@ -587,6 +772,12 @@ const requestHandler = (req: IncomingMessage, res: ServerResponse) => {
     console.error("[termany] request failed:", msg);
     json(500, { error: msg });
   };
+  /** As `fail`, but a body the client got wrong is a 400, not a 500 — an agent
+   *  reading its own error needs to know whose fault it was. */
+  const failControl = (err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    json(400, { ok: false, error: { code: "E_UNSUPPORTED", message: msg } });
+  };
   const reqUrl = new URL(req.url ?? "/", "http://localhost");
 
   // Agent activity is server-owned so every app window reads the same state.
@@ -637,6 +828,67 @@ const requestHandler = (req: IncomingMessage, res: ServerResponse) => {
   }
   if (req.method === "GET" && reqUrl.pathname === "/api/web/panes") {
     json(200, { panes: listWebInspectPanes() });
+    return;
+  }
+
+  // --- pane control -------------------------------------------------------
+  // Plain HTTP, because the caller is an agent: a shell process that wants one
+  // `curl` and has no lifecycle worth maintaining a socket for (D4). The
+  // renderer's half of this rides the /control WebSocket instead.
+  //
+  // Every call carries a token proving which pane it came from. 401 answers
+  // "who are you"; anything the policy layer refuses answers 403 — keeping
+  // those apart is what makes a misconfigured token debuggable.
+  if (req.method === "POST" && reqUrl.pathname === "/api/control/rpc") {
+    const caller = controlIdentity.identify(tokenFromHeaders(req.headers as any));
+    if (!caller) {
+      json(401, { ok: false, error: { code: "E_FORBIDDEN", message: "unknown control token" } });
+      return;
+    }
+    readJson(req, 64_000)
+      .then(async (body) => {
+        const method = String(body?.method ?? "");
+        const result = await dispatch(controlDeps(), caller, method, body?.params ?? {});
+        json(result.ok ? 200 : statusForError(result.error.code), result);
+      })
+      .catch(failControl);
+    return;
+  }
+
+  // Trade a nonce the agent printed to its own tty for that pane's token. The
+  // tty is the proof: a hostile page can reach loopback, but it cannot make
+  // chosen bytes appear in a real PTY's output stream.
+  if (req.method === "POST" && reqUrl.pathname === "/api/control/claim") {
+    readJson(req, 4_000)
+      .then((body) => {
+        const nonce = String(body?.nonce ?? "");
+        const claimed = nonce ? controlIdentity.redeemClaim(nonce) : undefined;
+        if (!claimed) {
+          // One message for every failure mode — expired, already used, never
+          // seen. Distinguishing them would tell a guesser which half it got right.
+          json(403, {
+            ok: false,
+            error: { code: "E_FORBIDDEN", message: "no pending claim for that nonce" },
+          });
+          return;
+        }
+        json(200, { ok: true, token: claimed.token, paneId: claimed.paneId });
+      })
+      .catch(failControl);
+    return;
+  }
+
+  // The audit trail. Read-only, and deliberately not token-gated: this is the
+  // app's own window asking what agents have been doing, and it is the one
+  // endpoint that must keep working when a token has gone wrong.
+  if (req.method === "GET" && reqUrl.pathname === "/api/control/audit") {
+    json(
+      200,
+      controlAudit.read(
+        Number(reqUrl.searchParams.get("since") ?? 0),
+        Number(reqUrl.searchParams.get("limit") ?? 200)
+      )
+    );
     return;
   }
   if (req.method === "GET" && reqUrl.pathname === "/api/activity/events") {
@@ -1454,11 +1706,7 @@ function tryListen(): void {
             `clients that resolve localhost to IPv6 should use 127.0.0.1`
         );
       });
-      httpSecondary.on("upgrade", (req, socket, head) => {
-        // wss owns the primary server's upgrades; forward the secondary's by
-        // hand. handleUpgrade still runs verifyClient, so the guard applies.
-        wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
-      });
+      httpSecondary.on("upgrade", routeUpgrade);
       httpSecondary.listen(PORT, SECONDARY_BIND, () => {
         console.log(`[termany] also listening on ws://[${SECONDARY_BIND}]:${PORT}`);
       });
@@ -1482,21 +1730,53 @@ http.on("error", (err: NodeJS.ErrnoException) => {
   throw err;
 });
 
-// A WebSocket upgrade is NOT subject to CORS — a hostile page can open one to
-// any origin and read every frame. So the same guard has to run here, and it
-// has to run before the handshake is accepted rather than after.
-const wss = new WebSocketServer({
-  server: http,
-  verifyClient: ({ req }, done) => {
-    logOrigin(req.headers.origin);
-    const verdict = guard(req.headers, GUARD_CONFIG);
-    if (verdict.ok) {
-      done(true);
-      return;
-    }
+/**
+ * Two WebSocket endpoints now share the port, so neither server may own the
+ * upgrade event: `/control` carries the renderer's pane mirror, everything else
+ * is a PTY session. `noServer` on both, with routeUpgrade dispatching by path.
+ *
+ * A WebSocket upgrade is NOT subject to CORS — a hostile page can open one to
+ * any origin and read every frame. So the same guard has to run here, and it has
+ * to run before the handshake is accepted rather than after. With `noServer`
+ * there is no verifyClient to hang it on, so routeUpgrade applies it by hand and
+ * rejects the socket itself.
+ */
+const wss = new WebSocketServer({ noServer: true });
+const controlWss = new WebSocketServer({ noServer: true });
+
+function routeUpgrade(
+  req: import("node:http").IncomingMessage,
+  socket: import("node:stream").Duplex,
+  head: Buffer
+): void {
+  logOrigin(req.headers.origin);
+  const verdict = guard(req.headers, GUARD_CONFIG);
+  if (!verdict.ok) {
     logRejection(verdict, req.url ?? "/");
-    done(false, 403, "forbidden");
-  },
+    socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+  const pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+  const target = pathname === "/control" ? controlWss : wss;
+  target.handleUpgrade(req, socket, head, (ws) => target.emit("connection", ws, req));
+}
+
+http.on("upgrade", routeUpgrade);
+
+/**
+ * A window announcing its panes. The socket IS the ownership signal: when it
+ * closes, the server stops believing those panes exist, which is exactly right
+ * for a window that was just closed and much simpler than any heartbeat.
+ */
+controlWss.on("connection", (ws: WebSocket) => {
+  const { hostId, detach } = controlHub.attach({
+    send: (payload) => ws.send(payload),
+    close: () => ws.close(),
+  });
+  ws.on("message", (raw) => controlHub.handleMessage(hostId, String(raw)));
+  ws.on("close", detach);
+  ws.on("error", detach);
 });
 
 let connCount = 0;
@@ -1842,7 +2122,20 @@ wss.on("connection", async (ws: WebSocket, req) => {
       cols: 80,
       rows: 24,
       cwd,
-      env: ptyEnvironment(),
+      env: {
+        ...ptyEnvironment(),
+        // Identity for anything the user runs in this pane, so an agent started
+        // here needs no handshake. Local shells only: an SSH pane's environment
+        // travels to another machine, where a loopback control URL is a
+        // different host's loopback and the token would be leaving this one.
+        ...(sshArgs || !sessionId
+          ? {}
+          : controlEnvironment(
+              paneIdOfSession(sessionId),
+              controlIdentity.tokenForPane(paneIdOfSession(sessionId)),
+              CONTROL_BASE_URL
+            )),
+      },
     });
   } catch (err) {
     // Never let one bad spawn take down the whole server.

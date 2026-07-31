@@ -117,6 +117,20 @@ function formatToolOutput(content: unknown, rawOutput: unknown): string | undefi
   }
 }
 
+/**
+ * Extra environment for a pane's ACP agent, injected by index.ts.
+ *
+ * The pane-control token registry lives with the server that answers control
+ * calls; this module only needs to hand whatever it produces to the child. A
+ * provider rather than an import keeps that one-way — acpRuntime has no business
+ * knowing how identity is minted.
+ */
+let controlEnvFor: (paneId: string) => Record<string, string> = () => ({});
+
+export function setControlEnvProvider(fn: (paneId: string) => Record<string, string>): void {
+  controlEnvFor = fn;
+}
+
 class Runtime {
   private emit: Emit | null = null;
   private prompting = false;
@@ -166,7 +180,10 @@ class Runtime {
     // Adapters shell out to node/npx and the agent CLI itself, so they need the
     // login PATH rather than the bundle's launchd-inherited one — but not the
     // API keys a shell profile may also export. See agentCredentials.ts.
-    const env = subscriptionEnvironment(await spawnEnvironment(), agent);
+    // Plus the pane's control identity, so an ACP agent can address panes on the
+    // same footing as an agent the user started in a terminal — per-session and
+    // per-pane, nothing written to disk.
+    const env = { ...subscriptionEnvironment(await spawnEnvironment(), agent), ...controlEnvFor(paneId) };
     const dropped = overriddenCredentials(agent).filter((name) => name in process.env);
     if (dropped.length) {
       console.log(`[termany] ${agent.name}: using its own login, ignoring ${dropped.join(", ")}`);
