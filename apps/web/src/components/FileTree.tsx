@@ -1,7 +1,9 @@
+import { textInputProps } from "../textInputProps";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { CodeEditor } from "./CodeEditor";
 import { DocxPreview, PptxPreview, XlsxPreview } from "./OfficePreview";
 import { apiUrl } from "../api";
+import { useImeGuard } from "../imeGuard";
 import { revealPath } from "../openExternal";
 import { activeHtab, findLeaf, useStore } from "../state/store";
 import { sendCommand } from "../terminal/manager";
@@ -937,6 +939,7 @@ export function FileTree({
 
   // One button, two jobs: collapse everything (remembering what was open),
   // then flip to restoring that exact set back open again.
+  const ime = useImeGuard();
   const collapsedAll = expanded.size === 0 && !!collapsedFrom;
   const toggleCollapseAll = () => {
     if (collapsedAll) {
@@ -954,9 +957,10 @@ export function FileTree({
     <>
       <div className="file-tree-head">
         <input
+          {...textInputProps}
           className="file-tree-path file-tree-path-input"
+          {...ime.props}
           value={addressDraft}
-          spellCheck={false}
           title={root ?? ""}
           onFocus={() => setAddressFocused(true)}
           onChange={(e) => setAddressDraft(e.target.value)}
@@ -965,7 +969,7 @@ export function FileTree({
             setAddressDraft(root ?? "");
           }}
           onKeyDown={(e) => {
-            if (e.nativeEvent.isComposing) return;
+            if (ime.handled(e)) return;
             if (e.key === "Enter") {
               const target = addressDraft.trim();
               if (target && target !== root) navigateTo(target);

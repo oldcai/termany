@@ -3,15 +3,13 @@
  *
  * Each supported agent stores transcripts on disk in its own format:
  *  - claude: ~/.claude/projects/<path-slug>/<uuid>.jsonl — no cumulative token
- *    field anywhere, so totals require streaming the WHOLE file (hundreds of
- *    MB across all sessions). An mtime-keyed cache plus a startup warm-up
- *    keeps that one-time cost off the request path.
+ *    field anywhere, so usage totals require streaming the whole file.
  *  - codex:  ~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl — line 1 is
  *    session_meta; token_count events (with per-turn last_token_usage) are
  *    scattered through the file, so it's streamed end-to-end like claude.
  *
- * Each parse also buckets token usage by local day + model (UsageBucket),
- * powering the usage dashboard via listAgentUsage().
+ * History is paginated and reads only transcript headers. Usage reads complete
+ * files only when their mtime intersects the requested (maximum 31-day) range.
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -27,6 +25,17 @@ export interface AgentSession {
   totalTokens: number | null;
   /** Size of the live context as of the last turn (null if unknown). */
   contextTokens: number | null;
+  /** Git branch the session ran on, as recorded in its transcript. */
+  gitBranch: string | null;
+  /** Set (per request, never cached) when `cwd` no longer exists on disk —
+   * typically a worktree that has since been deleted. */
+  cwdMissing?: true;
+}
+
+export interface AgentSessionPage {
+  sessions: AgentSession[] | null;
+  /** Opaque position of the next file to inspect; null means the scan is done. */
+  nextCursor: string | null;
 }
 
 /** One day's token usage for one model within a single session file. */
@@ -52,11 +61,17 @@ interface ParsedFile {
 }
 
 const HEAD_LINES = 40;
-const SESSION_CAP = 200;
+export const DEFAULT_SESSION_PAGE_SIZE = 30;
+const MAX_SESSION_PAGE_SIZE = 100;
 const PREVIEW_CHARS = 160;
 
-// path → parsed file, valid while the file's identity (mtime+size) holds.
-const cache = new Map<string, { mtimeMs: number; size: number; parsed: ParsedFile }>();
+// Full token parses and lightweight session-head parses are cached separately.
+// Opening history should never promote a cheap head read into a multi-GB usage
+// scan, while a completed usage parse can still satisfy the history browser.
+const fullCache = new Map<string, { mtimeMs: number; size: number; parsed: ParsedFile }>();
+const sessionCache = new Map<string, { mtimeMs: number; size: number; session: AgentSession }>();
+const fullInflight = new Map<string, Promise<ParsedFile | null>>();
+const sessionInflight = new Map<string, Promise<AgentSession | null>>();
 
 /** Bucket timestamps by the server's local calendar day (matches how users think about "today"). */
 function localDate(ts: string): string | null {
@@ -92,11 +107,118 @@ function cleanPreview(s: string): string {
   return s.replace(/\s+/g, " ").trim().slice(0, PREVIEW_CHARS);
 }
 
+/** Read only enough of a Claude transcript to render one history row. */
+async function parseClaudeSessionHead(abs: string, st: fs.Stats): Promise<AgentSession> {
+  let cwd: string | null = null;
+  let gitBranch: string | null = null;
+  let summary = "";
+  let firstUserText = "";
+  let lineNo = 0;
+  const rl = readline.createInterface({
+    input: fs.createReadStream(abs, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+  for await (const line of rl) {
+    lineNo++;
+    let entry: any;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      if (lineNo >= HEAD_LINES) break;
+      continue;
+    }
+    if (!cwd && typeof entry?.cwd === "string") cwd = entry.cwd;
+    if (!gitBranch && typeof entry?.gitBranch === "string" && entry.gitBranch) gitBranch = entry.gitBranch;
+    const ws = entry?.worktreeSession;
+    if (typeof ws?.worktreeBranch === "string" && (!cwd || cwd === ws.worktreePath)) {
+      gitBranch = ws.worktreeBranch;
+      if (!cwd && typeof ws.worktreePath === "string") cwd = ws.worktreePath;
+    }
+    if (!summary && entry?.type === "summary" && typeof entry.summary === "string") summary = entry.summary;
+    if (!firstUserText && entry?.type === "user" && !entry.isMeta) {
+      const content = entry.message?.content;
+      const text =
+        typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content.find((c: any) => c?.type === "text" && typeof c.text === "string")?.text ?? ""
+            : "";
+      const clean = text.trim();
+      if (clean && !clean.startsWith("<")) firstUserText = clean;
+    }
+    if ((cwd && (summary || firstUserText)) || lineNo >= HEAD_LINES) break;
+  }
+  return {
+    sessionId: path.basename(abs, ".jsonl"),
+    cwd,
+    preview: cleanPreview(summary || firstUserText),
+    mtimeMs: st.mtimeMs,
+    // Totals require a full transcript pass; history pagination deliberately
+    // stays lightweight. A cached usage parse fills these fields automatically.
+    totalTokens: null,
+    contextTokens: null,
+    gitBranch,
+  };
+}
+
+/** Read session_meta + the first real user prompt, then close the Codex file. */
+async function parseCodexSessionHead(abs: string, st: fs.Stats): Promise<AgentSession | null> {
+  let sessionId: string | null = null;
+  let cwd: string | null = null;
+  let gitBranch: string | null = null;
+  let firstUserText = "";
+  let lineNo = 0;
+  const rl = readline.createInterface({
+    input: fs.createReadStream(abs, { encoding: "utf8" }),
+    crlfDelay: Infinity,
+  });
+  for await (const line of rl) {
+    lineNo++;
+    let entry: any;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      if (lineNo >= HEAD_LINES) break;
+      continue;
+    }
+    const p = entry?.payload;
+    if (entry?.type === "session_meta" && p) {
+      if (typeof p.id === "string") sessionId = p.id;
+      if (typeof p.cwd === "string") cwd = p.cwd;
+      if (typeof p.git?.branch === "string") gitBranch = p.git.branch;
+    }
+    if (!firstUserText) {
+      let text = "";
+      if (entry?.type === "response_item" && p?.type === "message" && p.role === "user") {
+        text = Array.isArray(p.content)
+          ? p.content.find((c: any) => c?.type === "input_text" && typeof c.text === "string")?.text ?? ""
+          : "";
+      } else if (entry?.type === "event_msg" && p?.type === "user_message" && typeof p.message === "string") {
+        text = p.message;
+      }
+      const clean = text.trim();
+      if (clean && !clean.startsWith("<")) firstUserText = clean;
+    }
+    if ((sessionId && firstUserText) || lineNo >= HEAD_LINES) break;
+  }
+  if (!sessionId) return null;
+  return {
+    sessionId,
+    cwd,
+    preview: cleanPreview(firstUserText),
+    mtimeMs: st.mtimeMs,
+    totalTokens: null,
+    contextTokens: null,
+    gitBranch,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // claude
 
 async function parseClaudeFile(abs: string, st: fs.Stats): Promise<ParsedFile> {
   let cwd: string | null = null;
+  let gitBranch: string | null = null;
   let summary = "";
   let firstUserText = "";
   let totalTokens = 0;
@@ -149,6 +271,14 @@ async function parseClaudeFile(abs: string, st: fs.Stats): Promise<ParsedFile> {
       continue; // a line still being written
     }
     if (!cwd && typeof entry?.cwd === "string") cwd = entry.cwd;
+    if (!gitBranch && typeof entry?.gitBranch === "string" && entry.gitBranch) gitBranch = entry.gitBranch;
+    // A worktree session's early lines still carry the pre-enter branch; the
+    // worktree-state record knows the branch the session actually ran on.
+    const ws = entry?.worktreeSession;
+    if (typeof ws?.worktreeBranch === "string" && (!cwd || cwd === ws.worktreePath)) {
+      gitBranch = ws.worktreeBranch;
+      if (!cwd && typeof ws.worktreePath === "string") cwd = ws.worktreePath;
+    }
     if (!summary && entry?.type === "summary" && typeof entry.summary === "string") {
       summary = entry.summary;
     }
@@ -174,6 +304,7 @@ async function parseClaudeFile(abs: string, st: fs.Stats): Promise<ParsedFile> {
       mtimeMs: st.mtimeMs,
       totalTokens: sawUsage ? totalTokens : null,
       contextTokens,
+      gitBranch,
     },
     usage: [...buckets.values()],
   };
@@ -209,6 +340,7 @@ async function listClaudeFiles(): Promise<string[]> {
 async function parseCodexFile(abs: string, st: fs.Stats): Promise<ParsedFile | null> {
   let sessionId: string | null = null;
   let cwd: string | null = null;
+  let gitBranch: string | null = null;
   let firstUserText = "";
   let lineNo = 0;
   let model = "unknown";
@@ -255,6 +387,7 @@ async function parseCodexFile(abs: string, st: fs.Stats): Promise<ParsedFile | n
     if (entry?.type === "session_meta" && p) {
       if (typeof p.id === "string") sessionId = p.id;
       if (typeof p.cwd === "string") cwd = p.cwd;
+      if (typeof p.git?.branch === "string") gitBranch = p.git.branch;
     }
     if (!firstUserText) {
       // User text appears both as response_item message rows and user_message
@@ -281,6 +414,7 @@ async function parseCodexFile(abs: string, st: fs.Stats): Promise<ParsedFile | n
       mtimeMs: st.mtimeMs,
       totalTokens,
       contextTokens,
+      gitBranch,
     },
     usage: [...buckets.values()],
   };
@@ -302,35 +436,100 @@ async function listCodexFiles(): Promise<string[]> {
 
 const PROVIDERS: Record<
   string,
-  { list: () => Promise<string[]>; parse: (abs: string, st: fs.Stats) => Promise<ParsedFile | null> }
+  {
+    list: () => Promise<string[]>;
+    parse: (abs: string, st: fs.Stats) => Promise<ParsedFile | null>;
+    parseSession: (abs: string, st: fs.Stats) => Promise<AgentSession | null>;
+  }
 > = {
-  claude: { list: listClaudeFiles, parse: parseClaudeFile },
-  codex: { list: listCodexFiles, parse: parseCodexFile },
+  claude: { list: listClaudeFiles, parse: parseClaudeFile, parseSession: parseClaudeSessionHead },
+  codex: { list: listCodexFiles, parse: parseCodexFile, parseSession: parseCodexSessionHead },
 };
 
 export function supportedAgents(): string[] {
   return Object.keys(PROVIDERS);
 }
 
-/** Every parsed session file for one agent, through the mtime cache. */
-async function scanAgent(agent: string): Promise<ParsedFile[]> {
+interface AgentFile {
+  abs: string;
+  st: fs.Stats;
+}
+
+/** Stat and newest-sort transcripts without opening their contents. */
+async function listAgentFileEntries(agent: string, sinceMs = 0): Promise<AgentFile[]> {
   const provider = PROVIDERS[agent];
   if (!provider) return [];
   const files = await provider.list();
-  const parsed: ParsedFile[] = [];
-  for (const abs of files) {
-    try {
-      const st = await fs.promises.stat(abs);
-      if (!st.isFile() || st.size === 0) continue;
-      const hit = cache.get(abs);
-      if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) {
-        parsed.push(hit.parsed);
-        continue;
+  const entries = await Promise.all(
+    files.map(async (abs): Promise<AgentFile | null> => {
+      try {
+        const st = await fs.promises.stat(abs);
+        if (!st.isFile() || st.size === 0 || st.mtimeMs < sinceMs) return null;
+        return { abs, st };
+      } catch {
+        return null;
       }
-      const file = await provider.parse(abs, st);
-      if (!file) continue;
-      cache.set(abs, { mtimeMs: st.mtimeMs, size: st.size, parsed: file });
-      parsed.push(file);
+    })
+  );
+  return entries
+    .filter((entry): entry is AgentFile => entry !== null)
+    .sort((a, b) => b.st.mtimeMs - a.st.mtimeMs || a.abs.localeCompare(b.abs));
+}
+
+async function parseFullFile(
+  provider: (typeof PROVIDERS)[string],
+  { abs, st }: AgentFile
+): Promise<ParsedFile | null> {
+  const hit = fullCache.get(abs);
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.parsed;
+  const key = `${abs}\0${st.mtimeMs}\0${st.size}`;
+  const pending = fullInflight.get(key);
+  if (pending) return pending;
+  const parse = provider
+    .parse(abs, st)
+    .then((file) => {
+      if (!file) return null;
+      fullCache.set(abs, { mtimeMs: st.mtimeMs, size: st.size, parsed: file });
+      sessionCache.set(abs, { mtimeMs: st.mtimeMs, size: st.size, session: file.session });
+      return file;
+    })
+    .finally(() => fullInflight.delete(key));
+  fullInflight.set(key, parse);
+  return parse;
+}
+
+async function parseSessionFile(
+  provider: (typeof PROVIDERS)[string],
+  { abs, st }: AgentFile
+): Promise<AgentSession | null> {
+  const full = fullCache.get(abs);
+  if (full && full.mtimeMs === st.mtimeMs && full.size === st.size) return full.parsed.session;
+  const hit = sessionCache.get(abs);
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.session;
+  const key = `${abs}\0${st.mtimeMs}\0${st.size}`;
+  const pending = sessionInflight.get(key);
+  if (pending) return pending;
+  const parse = provider
+    .parseSession(abs, st)
+    .then((session) => {
+      if (session) sessionCache.set(abs, { mtimeMs: st.mtimeMs, size: st.size, session });
+      return session;
+    })
+    .finally(() => sessionInflight.delete(key));
+  sessionInflight.set(key, parse);
+  return parse;
+}
+
+/** Full token parses for usage, limited to files updated in the requested window. */
+async function scanAgent(agent: string, sinceMs: number): Promise<ParsedFile[]> {
+  const provider = PROVIDERS[agent];
+  if (!provider) return [];
+  const files = await listAgentFileEntries(agent, sinceMs);
+  const parsed: ParsedFile[] = [];
+  for (const file of files) {
+    try {
+      const result = await parseFullFile(provider, file);
+      if (result) parsed.push(result);
     } catch {
       /* unreadable or deleted mid-scan — skip */
     }
@@ -338,26 +537,108 @@ async function scanAgent(agent: string): Promise<ParsedFile[]> {
   return parsed;
 }
 
-/** Newest-first sessions for one agent, or null when the agent has no reader. */
-export async function listAgentSessions(agent: string): Promise<AgentSession[] | null> {
-  if (!PROVIDERS[agent]) return null;
-  const sessions = (await scanAgent(agent)).map((f) => f.session);
-  sessions.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  return sessions.slice(0, SESSION_CAP);
+/** Whether `cwd` sits at or below `root` (plain prefix on path segments). */
+function underRoot(cwd: string, root: string): boolean {
+  return cwd === root || cwd.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
 }
 
 /**
- * Daily token usage across every supported agent, merged by
- * agent+project+date+model (project = the session file's cwd). Backs the
- * SideRail usage dashboard; the frontend does range filtering, aggregation,
- * and cost estimation.
+ * One newest-first page for an agent, or null when the agent has no reader.
+ * `roots` scopes the list to sessions whose cwd lives under any of the given
+ * directories (the history browser passes every worktree root of the current
+ * repo). The file cursor advances past non-matching sessions so a scoped page
+ * still contains up to `limit` rows without full transcript parsing.
+ *
+ * Each returned session is also checked against the filesystem: a cwd that no
+ * longer exists (a deleted worktree, usually) gets cwdMissing so the client
+ * can warn and resume somewhere sensible. Checked per request — the parse
+ * cache outlives worktrees.
  */
-export async function listAgentUsage(): Promise<AgentUsageRow[]> {
+export async function listAgentSessions(
+  agent: string,
+  roots: string[] = [],
+  cursor = 0,
+  requestedLimit = DEFAULT_SESSION_PAGE_SIZE
+): Promise<AgentSessionPage> {
+  const provider = PROVIDERS[agent];
+  if (!provider) return { sessions: null, nextCursor: null };
+  const files = await listAgentFileEntries(agent);
+  const start = Number.isSafeInteger(cursor) && cursor >= 0 ? Math.min(cursor, files.length) : 0;
+  const safeLimit = Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : DEFAULT_SESSION_PAGE_SIZE;
+  const limit = Math.max(1, Math.min(MAX_SESSION_PAGE_SIZE, safeLimit));
+  const sessions: AgentSession[] = [];
+  const ids = new Set<string>();
+  let index = start;
+  // The cursor counts transcript files, not returned rows. Scoped pages may
+  // cheaply inspect more than `limit` file heads to find enough matching cwd's.
+  while (index < files.length && sessions.length < limit) {
+    const file = files[index++];
+    try {
+      const session = await parseSessionFile(provider, file);
+      if (!session || ids.has(session.sessionId)) continue;
+      if (roots.length && (!session.cwd || !roots.some((root) => underRoot(session.cwd!, root)))) continue;
+      ids.add(session.sessionId);
+      sessions.push(session);
+    } catch {
+      /* unreadable or deleted mid-scan — skip */
+    }
+  }
+  const exists = new Map<string, boolean>();
+  const checked = await Promise.all(
+    sessions.map(async (s) => {
+      if (!s.cwd) return s;
+      let ok = exists.get(s.cwd);
+      if (ok === undefined) {
+        ok = await fs.promises
+          .stat(s.cwd)
+          .then((st) => st.isDirectory())
+          .catch(() => false);
+        exists.set(s.cwd, ok);
+      }
+      // Copy rather than mutate: the session object lives in the parse cache.
+      return ok ? s : { ...s, cwdMissing: true as const };
+    })
+  );
+  return { sessions: checked, nextCursor: index < files.length ? String(index) : null };
+}
+
+/**
+ * Validate a requested local date and cap it to a rolling 31-day window.
+ * Missing/invalid/future values intentionally fall back to today.
+ */
+export function normalizeUsageSince(requested?: string | null, now = new Date()): string {
+  const today = localDate(now.toISOString())!;
+  const oldest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 30);
+  const oldestDate = localDate(oldest.toISOString())!;
+  if (!requested || !/^\d{4}-\d{2}-\d{2}$/.test(requested)) return today;
+  const [year, month, day] = requested.split("-").map(Number);
+  const parsed = new Date(year, month - 1, day);
+  if (
+    parsed.getFullYear() !== year ||
+    parsed.getMonth() !== month - 1 ||
+    parsed.getDate() !== day ||
+    requested > today
+  ) {
+    return today;
+  }
+  return requested < oldestDate ? oldestDate : requested;
+}
+
+function localDateStart(date: string): number {
+  const [year, month, day] = date.split("-").map(Number);
+  return new Date(year, month - 1, day).getTime();
+}
+
+/** Daily usage merged by agent/project/date/model inside the bounded range. */
+export async function listAgentUsage(requestedSince?: string | null): Promise<AgentUsageRow[]> {
+  const since = normalizeUsageSince(requestedSince);
+  const sinceMs = localDateStart(since);
   const merged = new Map<string, AgentUsageRow>();
   for (const agent of supportedAgents()) {
-    for (const file of await scanAgent(agent)) {
+    for (const file of await scanAgent(agent, sinceMs)) {
       const project = file.session.cwd;
       for (const b of file.usage) {
+        if (b.date < since) continue;
         const key = `${agent}|${project ?? ""}|${b.date}|${b.model}`;
         let row = merged.get(key);
         if (!row) {
@@ -372,16 +653,4 @@ export async function listAgentUsage(): Promise<AgentUsageRow[]> {
     }
   }
   return [...merged.values()].sort((a, b) => a.date.localeCompare(b.date));
-}
-
-/**
- * Pre-fill the cache shortly after startup so the first open of the history
- * browser doesn't pay the claude full-file scan (~10s cold) interactively.
- */
-export function warmAgentSessionCache(): void {
-  setTimeout(() => {
-    (async () => {
-      for (const agent of supportedAgents()) await listAgentSessions(agent);
-    })().catch(() => {});
-  }, 3000);
 }

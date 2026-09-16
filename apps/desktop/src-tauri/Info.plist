@@ -38,17 +38,25 @@
       <string>openInTermany</string>
       <key>NSPortName</key>
       <string>Termany</string>
+      <!-- Finder's contextual Services submenu matches on the *text* of the
+           selection (its path) rather than on the file-URL flavours, so the
+           FilePath context plus public.plain-text below are what actually make
+           the item show up — this mirrors Terminal.app's own declaration. -->
+      <key>NSRequiredContext</key>
+      <dict>
+        <key>NSTextContent</key>
+        <string>FilePath</string>
+      </dict>
       <key>NSSendFileTypes</key>
       <array>
-        <string>public.item</string>
-        <string>public.data</string>
         <string>public.folder</string>
         <string>public.directory</string>
+        <string>com.apple.resolvable</string>
       </array>
       <key>NSSendTypes</key>
       <array>
         <string>NSFilenamesPboardType</string>
-        <string>public.file-url</string>
+        <string>public.plain-text</string>
       </array>
     </dict>
   </array>

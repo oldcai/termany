@@ -1,11 +1,19 @@
 import { applyTermTheme } from "../terminal/manager";
+import { aurora } from "./aurora";
 import { charcoal } from "./charcoal";
 import { codex } from "./codex";
 import { daylight } from "./daylight";
 import { defaultDark } from "./default-dark";
+import { gruvbox } from "./gruvbox";
+import { gruvboxLight } from "./gruvbox-light";
+import { horizon } from "./horizon";
 import { meadow } from "./meadow";
+import { phosphor } from "./phosphor";
+import { rosePine } from "./rose-pine";
+import { rosePineDawn } from "./rose-pine-dawn";
 import { solarizedDark } from "./solarized-dark";
 import type { Theme } from "./types";
+import { win98 } from "./win98";
 
 export type { Theme };
 export { fromCodexTheme, isCodexTheme } from "./codex-import";
@@ -21,7 +29,15 @@ export const THEMES: Theme[] = [
   daylight,
   meadow,
   charcoal,
+  gruvbox,
+  gruvboxLight,
+  rosePine,
+  rosePineDawn,
+  aurora,
+  horizon,
+  phosphor,
   codex,
+  win98,
 ];
 
 /** The bundled themes, i.e. THEMES minus anything registered at runtime. */
@@ -144,15 +160,16 @@ function applyThemeObject(theme: Theme) {
     return c === "transparent" || c === "none" ? "0 solid transparent" : `1px solid ${c}`;
   };
 
-  // A background image shows through the pane gaps + sidebar/top bar, which
-  // get alpha-blended below; the terminal panes (--bg) stay fully opaque on
-  // purpose (see the `background` field's doc comment in themes/types.ts).
+  // A background image shows through the pane gaps, sidebar/top bar and Bots
+  // conversation canvas, which get alpha-blended below. Terminal panes keep
+  // their own contrast contract (see the `background` field in types.ts).
   const bgImage = theme.background?.image;
   const opacity = theme.background?.opacity ?? 1;
   const blend = (c: string) => (bgImage ? withAlpha(c, opacity) : c);
 
   root.style.setProperty("--bg-image", bgImage ? `url("${bgImage}")` : "none");
   root.style.setProperty("--pane-area-bg", blend(colors.bg2));
+  root.style.setProperty("--agent-surface-bg", blend(colors.bg));
   root.style.setProperty("--sidebar-bg", blend(theme.sidebar?.bg ?? colors.bg2));
   root.style.setProperty("--sidebar-border", borderRule(theme.sidebar?.border, colors.border));
   root.style.setProperty("--top-bar", blend(theme.chrome?.topBar ?? colors.bg2));
@@ -176,6 +193,10 @@ function applyThemeObject(theme: Theme) {
     root.style.setProperty(k.startsWith("--") ? k : `--${k}`, v);
   }
   root.dataset.appearance = theme.appearance;
+  // A theme whose look needs more than the flat tokens (Windows 98's 3D bevels,
+  // say) ships its own stylesheet scoped to html[data-theme="<id>"]. Every other
+  // theme just leaves that attribute unmatched.
+  root.dataset.theme = theme.id;
 
   applyTermTheme(theme.term);
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { extractServedUrls, mergeServedUrls } from "./servedUrls";
+import { extractServedUrls, mergeServedUrls, servedUrlBrowserUrl } from "./servedUrls";
 
 test("picks up the URL vite prints, colour codes and all", () => {
   // Vite bolds the port INSIDE the URL — a plain regex over the raw stream
@@ -96,4 +96,16 @@ test("hides an unannounced ephemeral port, keeps an announced one", () => {
 
 test("no live ports means no button", () => {
   assert.deepEqual(mergeServedUrls([], new Map([[3000, { url: "http://x:3000/", seq: 1 }]])), []);
+});
+
+test("a forwarded remote URL keeps its protocol, path, and query on the local port", () => {
+  assert.equal(
+    servedUrlBrowserUrl({
+      port: 3000,
+      url: "http://127.0.0.1:3000/app?mode=dev",
+      remote: true,
+      localPort: 13000,
+    }),
+    "http://localhost:13000/app?mode=dev",
+  );
 });

@@ -1,8 +1,15 @@
 import { loadConfig, type Provider } from "./config.js";
+import { botIdentityPrompt } from "./botIdentity.js";
+import { loadAgentImages, type AgentImageInput, type LoadedAgentImage } from "./agentImages.js";
 
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
+  images?: AgentImageInput[];
+}
+
+interface NormalizedChatMessage extends ChatMessage {
+  images: LoadedAgentImage[];
 }
 
 interface StreamEvent {
@@ -12,7 +19,7 @@ interface StreamEvent {
 
 const SYSTEM = `You are the assistant inside Termany, an agent-native terminal workspace.
 Be concise and practical. When the user asks about code, commands, or files, explain the next useful action clearly. Do not claim to have run tools or changed files unless the conversation explicitly contains their results.
-The conversation history may contain replies written by a different coding agent the user was talking to earlier in this pane. Treat those as context only — never adopt their identity, name, or model. When asked who you are, you are Termany's built-in chat assistant, and you have no tool access.`;
+The conversation history may contain replies written by a different coding agent the user was talking to earlier in this pane. Treat those as context only — never adopt their identity, name, or model. You have no tool access. Unless a current Bot profile is supplied below, identify yourself as Termany's built-in chat assistant.`;
 
 function endpoint(base: string, suffix: string): string {
   return `${base.replace(/\/+$/, "")}${suffix}`;
@@ -55,7 +62,8 @@ async function consumeSse(
 async function streamAnthropic(
   provider: Provider,
   model: string,
-  messages: ChatMessage[],
+  messages: NormalizedChatMessage[],
+  system: string,
   signal: AbortSignal,
   onText: (text: string) => void
 ): Promise<void> {
@@ -68,7 +76,21 @@ async function streamAnthropic(
       "x-api-key": provider.apiKey,
       "anthropic-version": "2023-06-01",
     },
-    body: JSON.stringify({ model, max_tokens: 4096, stream: true, system: SYSTEM, messages }),
+    body: JSON.stringify({
+      model,
+      max_tokens: 4096,
+      stream: true,
+      system,
+      messages: messages.map(({ role, content, images }) => images.length ? {
+        role,
+        content: [
+          ...images.map((image) => ({ type: "image", source: {
+            type: "base64", media_type: image.mimeType, data: image.data,
+          } })),
+          ...(content ? [{ type: "text", text: content }] : []),
+        ],
+      } : { role, content }),
+    }),
   });
   if (!response.ok) {
     throw new Error(`${provider.name} API ${response.status}: ${(await response.text()).slice(0, 300)}`);
@@ -84,7 +106,8 @@ async function streamAnthropic(
 async function streamOpenAI(
   provider: Provider,
   model: string,
-  messages: ChatMessage[],
+  messages: NormalizedChatMessage[],
+  system: string,
   signal: AbortSignal,
   onText: (text: string) => void
 ): Promise<void> {
@@ -97,7 +120,15 @@ async function streamOpenAI(
       model,
       max_tokens: 4096,
       stream: true,
-      messages: [{ role: "system", content: SYSTEM }, ...messages],
+      messages: [{ role: "system", content: system }, ...messages.map(({ role, content, images }) => images.length ? {
+        role,
+        content: [
+          ...(content ? [{ type: "text", text: content }] : []),
+          ...images.map((image) => ({ type: "image_url", image_url: {
+            url: `data:${image.mimeType};base64,${image.data}`,
+          } })),
+        ],
+      } : { role, content })],
     }),
   });
   if (!response.ok) {
@@ -114,7 +145,8 @@ export async function streamAgentChat(
   requestedModel: string | undefined,
   rawMessages: unknown,
   signal: AbortSignal,
-  onText: (text: string) => void
+  onText: (text: string) => void,
+  botIdentity?: unknown
 ): Promise<{ model: string }> {
   const cfg = loadConfig();
   const selected = requestedModel || cfg.defaultModel;
@@ -126,21 +158,28 @@ export async function streamAgentChat(
   if (!provider) throw new Error("Selected model provider no longer exists");
   if (!provider.apiKey) throw new Error(`${provider.name}: API key is not set`);
 
-  const messages = (Array.isArray(rawMessages) ? rawMessages : [])
+  const raw = (Array.isArray(rawMessages) ? rawMessages : [])
     .filter((item): item is ChatMessage =>
       !!item &&
       (item.role === "user" || item.role === "assistant") &&
       typeof item.content === "string" &&
-      item.content.trim().length > 0
+      (item.content.trim().length > 0 || (item.role === "user" && Array.isArray(item.images) && item.images.length > 0))
     )
     .slice(-80)
-    .map((item) => ({ role: item.role, content: item.content.slice(0, 100_000) }));
+    .map((item) => ({ role: item.role, content: item.content.slice(0, 100_000), images: item.images }));
+  const messages: NormalizedChatMessage[] = await Promise.all(raw.map(async (item) => ({
+    role: item.role,
+    content: item.content,
+    images: item.role === "user" ? await loadAgentImages(item.images) : [],
+  })));
   if (!messages.length) throw new Error("Message is empty");
+  const profile = botIdentityPrompt(botIdentity);
+  const system = profile ? `${SYSTEM}\n\n${profile}` : SYSTEM;
 
   if (provider.kind === "anthropic") {
-    await streamAnthropic(provider, model, messages, signal, onText);
+    await streamAnthropic(provider, model, messages, system, signal, onText);
   } else {
-    await streamOpenAI(provider, model, messages, signal, onText);
+    await streamOpenAI(provider, model, messages, system, signal, onText);
   }
   return { model: selected };
 }

@@ -1,11 +1,20 @@
-import { Bot, Brain, Info, Keyboard, Palette } from "lucide-react";
+import { textInputProps } from "../textInputProps";
+import { Bot, Brain, Info, Keyboard, Palette, UserRound } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 import { apiPath } from "../api";
 import { isTauri } from "../env";
-import { useI18n, type Language } from "../i18n";
+import { LANGUAGES, useI18n, type Language } from "../i18n";
+import { useImeGuard } from "../imeGuard";
 import { openExternal, revealPath } from "../openExternal";
+import { type RailItemId } from "../rail-config";
 import { useStore } from "../state/store";
-import { checkForUpdate, installUpdate, relaunchApp } from "../updater";
+import {
+  checkForUpdate,
+  installUpdate,
+  isUpdateInstalled,
+  relaunchApp,
+  runningTaskCount,
+} from "../updater";
 import { BUILT_IN_THEMES } from "../themes";
 import {
   codexThemeId,
@@ -13,8 +22,33 @@ import {
   registerCodexListing,
   type CodexListing,
 } from "../themes/codex-packs";
+import {
+  loadFontConfig,
+  saveFontConfig,
+  MIN_FONT_SIZE,
+  MAX_FONT_SIZE,
+  DEFAULT_FONT_CONFIG,
+  type FontConfig,
+} from "../font-config";
+import { applyFontFamily, applyFontSize } from "../terminal/manager";
 import { AgentSettings } from "./AgentSettings";
-import { CloseIcon, ExternalOpenIcon, GearIcon, RevealFolderIcon } from "./icons";
+import { AgentAvatarEditor } from "./AgentIdentityFields";
+import {
+  ActivityIcon,
+  AgentIcon,
+  ChartIcon,
+  ChatIcon,
+  CloseIcon,
+  ExternalOpenIcon,
+  FilesIcon,
+  GearIcon,
+  GitBranchIcon,
+  HistoryIcon,
+  ProviderIcon,
+  RevealFolderIcon,
+  TerminalIcon,
+  WebIcon,
+} from "./icons";
 import { KeyboardSettings } from "./KeyboardSettings";
 import { ModelSettings } from "./ModelSettings";
 import { UsageSelect } from "./Select";
@@ -32,10 +66,11 @@ const ABOUT_LINKS = [
   { key: "feedback", url: `${REPO}/issues` },
 ] as const;
 
-export type SettingsSection = "general" | "appearance" | "models" | "agents" | "keyboard" | "about";
+export type SettingsSection = "profile" | "general" | "appearance" | "models" | "agents" | "keyboard" | "about";
 
 /** Left-nav entries, in display order. Labels come from i18n (settings.<id>). */
 const NAV_SECTIONS: { id: SettingsSection; icon: ReactNode }[] = [
+  { id: "profile", icon: <UserRound size={16} /> },
   { id: "general", icon: <GearIcon /> },
   { id: "appearance", icon: <Palette size={16} /> },
   { id: "models", icon: <Brain size={16} /> },
@@ -44,6 +79,35 @@ const NAV_SECTIONS: { id: SettingsSection; icon: ReactNode }[] = [
   { id: "about", icon: <Info size={16} /> },
 ];
 
+const RAIL_SETTINGS: Array<{ id: RailItemId; labelKey: string; icon: ReactNode }> = [
+  { id: "terminal", labelKey: "pane.view.terminal", icon: <TerminalIcon /> },
+  { id: "files", labelKey: "pane.view.files", icon: <FilesIcon /> },
+  { id: "git", labelKey: "pane.view.git", icon: <GitBranchIcon /> },
+  { id: "agent", labelKey: "pane.view.agent", icon: <ChatIcon /> },
+  { id: "web", labelKey: "pane.view.web", icon: <WebIcon /> },
+  { id: "monitor", labelKey: "pane.view.monitor", icon: <ActivityIcon /> },
+  { id: "agents", labelKey: "settings.rail.agents", icon: <AgentIcon /> },
+  { id: "providers", labelKey: "pane.view.providers", icon: <ProviderIcon /> },
+  { id: "history", labelKey: "pane.view.history", icon: <HistoryIcon /> },
+  { id: "usage", labelKey: "pane.view.usage", icon: <ChartIcon /> },
+];
+
+const CUSTOM_FONT_FAMILY = "__custom__";
+const FONT_FAMILY_PRESETS = [
+  { value: DEFAULT_FONT_CONFIG.family, label: "Menlo / SF Mono" },
+  { value: "Menlo, monospace", label: "Menlo" },
+  { value: '"SF Mono", SFMono-Regular, Menlo, monospace', label: "SF Mono" },
+  { value: "Monaco, monospace", label: "Monaco" },
+  { value: '"JetBrains Mono", monospace', label: "JetBrains Mono" },
+  { value: '"Fira Code", monospace', label: "Fira Code" },
+  { value: '"Cascadia Code", "Cascadia Mono", monospace', label: "Cascadia Code" },
+  { value: 'Consolas, "Courier New", monospace', label: "Consolas" },
+] as const;
+
+function isPresetFontFamily(family: string): boolean {
+  return FONT_FAMILY_PRESETS.some((preset) => preset.value === family);
+}
+
 /**
  * App-wide settings, shown as an in-app overlay (works in both web and the
  * desktop build — no separate OS window to keep in sync). Left nav + right
@@ -51,17 +115,36 @@ const NAV_SECTIONS: { id: SettingsSection; icon: ReactNode }[] = [
  */
 export function Settings({
   initialSection = "general",
+  initialAgentId,
   onClose,
   onSectionChange,
+  onInstallAgent,
 }: {
   initialSection?: SettingsSection;
+  initialAgentId?: string;
   onClose: () => void;
   /** Reported so the panel can reopen where the user left it. */
   onSectionChange?: (section: SettingsSection) => void;
+  onInstallAgent?: (agentName: string, command: string) => boolean;
 }) {
   const { language, setLanguage, t } = useI18n();
   const theme = useStore((s) => s.theme);
   const setTheme = useStore((s) => s.setTheme);
+  const botEnabled = useStore((s) => s.botEnabled);
+  const setBotEnabled = useStore((s) => s.setBotEnabled);
+  const railVisibility = useStore((s) => s.railVisibility);
+  const setRailItemVisible = useStore((s) => s.setRailItemVisible);
+  const userProfile = useStore((s) => s.userProfile);
+  const setUserProfile = useStore((s) => s.setUserProfile);
+  const profileIme = useImeGuard();
+  const [profileNameDraft, setProfileNameDraft] = useState(userProfile.nickname);
+
+  useEffect(() => setProfileNameDraft(userProfile.nickname), [userProfile.nickname]);
+
+  const [fontConfig, setFontConfig] = useState<FontConfig>(loadFontConfig);
+  const [customFontFamily, setCustomFontFamily] = useState(
+    () => !isPresetFontFamily(fontConfig.family),
+  );
 
   const [section, setSection] = useState<SettingsSection>(initialSection);
 
@@ -71,6 +154,9 @@ export function Settings({
   };
   const [importError, setImportError] = useState<string | null>(null);
   const [codexThemes, setCodexThemes] = useState<CodexListing[]>([]);
+  const [codexThemesLoading, setCodexThemesLoading] = useState(false);
+  const [codexThemesError, setCodexThemesError] = useState<string | null>(null);
+  const [codexThemesReload, setCodexThemesReload] = useState(0);
   // Absolute path of ~/.codexthemes/themes, reported by the server so the
   // reveal button doesn't have to guess the home directory.
   const [themesRoot, setThemesRoot] = useState<string | null>(null);
@@ -79,11 +165,16 @@ export function Settings({
   const [aboutError, setAboutError] = useState<string | null>(null);
 
   // Self-update flow (desktop only): idle → checking → (none | available) →
-  // downloading → restarting. `updateVersion` is global so badges stay in sync.
+  // downloading → (waiting → ready | restarting). `updateVersion` is
+  // global so badges stay in sync; the installed flag lives in updater.ts so
+  // closing and reopening Settings does not offer to download it twice.
   const updateVersion = useStore((s) => s.updateVersion);
   const setUpdateVersion = useStore((s) => s.setUpdateVersion);
-  const [updPhase, setUpdPhase] = useState<"idle" | "checking" | "none" | "downloading" | "restarting">("idle");
+  const [updPhase, setUpdPhase] = useState<
+    "idle" | "checking" | "none" | "downloading" | "waiting" | "ready" | "restarting"
+  >(() => (isUpdateInstalled() ? "waiting" : "idle"));
   const [updPct, setUpdPct] = useState(0);
+  const [runningTasks, setRunningTasks] = useState(0);
   const [updError, setUpdError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -103,19 +194,56 @@ export function Settings({
     }
   }
 
+  async function finishUpdate() {
+    setUpdPhase("restarting");
+    setUpdError(null);
+    try {
+      const count = await relaunchApp();
+      if (count > 0) {
+        setRunningTasks(count);
+        setUpdPhase("waiting");
+      }
+    } catch (e) {
+      setUpdError(e instanceof Error ? e.message : String(e));
+      setUpdPhase("ready");
+    }
+  }
+
   async function applyUpdate() {
     setUpdPhase("downloading");
     setUpdPct(0);
     setUpdError(null);
     try {
       await installUpdate(setUpdPct);
-      setUpdPhase("restarting");
-      await relaunchApp();
+      await finishUpdate();
     } catch (e) {
       setUpdError(e instanceof Error ? e.message : String(e));
-      setUpdPhase("idle");
+      setUpdPhase(isUpdateInstalled() ? "ready" : "idle");
     }
   }
+
+  // Once installed, keep checking quietly while tasks finish. Restart remains
+  // an explicit click so completing a task never makes the app vanish under
+  // the user's hands.
+  useEffect(() => {
+    if (updPhase !== "waiting") return;
+    let cancelled = false;
+    const refresh = () => {
+      runningTaskCount()
+        .then((count) => {
+          if (cancelled) return;
+          setRunningTasks(count);
+          if (count === 0) setUpdPhase("ready");
+        })
+        .catch(() => {});
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [updPhase]);
 
   // The desktop app exposes the real bundle version; the browser keeps the default.
   useEffect(() => {
@@ -145,13 +273,22 @@ export function Settings({
   // refetched each time Appearance opens so newly created packages show up.
   useEffect(() => {
     if (section !== "appearance") return;
-    fetchCodexListings()
+    const controller = new AbortController();
+    setCodexThemesLoading(true);
+    setCodexThemesError(null);
+    fetchCodexListings({ signal: controller.signal })
       .then(({ themes, root }) => {
         setCodexThemes(themes);
         setThemesRoot(root);
+        setCodexThemesLoading(false);
       })
-      .catch(() => setCodexThemes([]));
-  }, [section]);
+      .catch((error) => {
+        if (controller.signal.aborted) return;
+        setCodexThemesError(error instanceof Error ? error.message : String(error));
+        setCodexThemesLoading(false);
+      });
+    return () => controller.abort();
+  }, [section, codexThemesReload]);
 
   /** One-click apply. The theme is registered in memory only — the folder on
    *  disk stays the source of truth and is re-read on the next launch. */
@@ -203,8 +340,47 @@ export function Settings({
         </aside>
 
         <div className="settings-body">
+          {section === "profile" && (
+            <>
+              <div className="settings-section-title">{t("settings.profile")}</div>
+              <div className="profile-settings-card">
+                <AgentAvatarEditor
+                  avatar={userProfile.avatar}
+                  fallback={<UserRound />}
+                  showReset={false}
+                  onAvatarChange={(avatar) => setUserProfile({ avatar })}
+                />
+                <label className="agent-setting-field profile-nickname-field">
+                  <span>{t("profile.nickname")}</span>
+                  <input
+                    {...textInputProps}
+                    {...profileIme.props}
+                    value={profileNameDraft}
+                    onFocus={(event) => event.currentTarget.select()}
+                    onChange={(event) => setProfileNameDraft(event.target.value)}
+                    onBlur={(event) => {
+                      const nickname = event.currentTarget.value.trim() || userProfile.nickname || "user";
+                      setProfileNameDraft(nickname);
+                      if (nickname !== userProfile.nickname) setUserProfile({ nickname });
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter" || profileIme.handled(event)) return;
+                      event.preventDefault();
+                      event.currentTarget.blur();
+                    }}
+                  />
+                </label>
+              </div>
+            </>
+          )}
           {section === "models" && <ModelSettings />}
-          {section === "agents" && <AgentSettings />}
+          {section === "agents" && (
+            <AgentSettings
+              initialAgentId={initialAgentId}
+              onInstallAgent={onInstallAgent}
+              onConfigureModels={() => goto("models")}
+            />
+          )}
           {section === "keyboard" && <KeyboardSettings />}
           {section === "general" && (
             <>
@@ -216,12 +392,49 @@ export function Settings({
                 <UsageSelect
                   value={language}
                   width={200}
-                  options={[
-                    { value: "en", label: t("settings.language.en") },
-                    { value: "zh-CN", label: t("settings.language.zh") },
-                  ]}
+                  options={LANGUAGES.map((l) => ({ value: l.value, label: l.label }))}
                   onChange={(v) => setLanguage(v as Language)}
                 />
+              </div>
+
+              <div className="settings-section-title">Bot</div>
+              <div className="language-setting bot-setting">
+                <div>
+                  <label id="bot-setting-label" htmlFor="bot-enabled">{t("settings.bot.label")}</label>
+                  <p id="bot-setting-description">{t("settings.bot.description")}</p>
+                </div>
+                <button
+                  id="bot-enabled"
+                  type="button"
+                  role="switch"
+                  className="bot-setting-switch"
+                  aria-checked={botEnabled}
+                  aria-labelledby="bot-setting-label"
+                  aria-describedby="bot-setting-description"
+                  onClick={() => setBotEnabled(!botEnabled)}
+                />
+              </div>
+
+              <div className="settings-section-title">{t("settings.rail.title")}</div>
+              <div className="rail-icons-setting">
+                <p>{t("settings.rail.description")}</p>
+                <div className="rail-icons-grid">
+                  {RAIL_SETTINGS.map(({ id, labelKey, icon }) => (
+                    <label
+                      key={id}
+                      className={`rail-icon-option ${railVisibility[id] ? "active" : ""}`}
+                    >
+                      <span className="rail-icon-option-icon">{icon}</span>
+                      <span className="rail-icon-option-label">{t(labelKey)}</span>
+                      <input
+                        type="checkbox"
+                        checked={railVisibility[id]}
+                        onChange={(event) => setRailItemVisible(id, event.target.checked)}
+                      />
+                    </label>
+                  ))}
+                </div>
+                <span className="rail-icons-note">{t("settings.rail.note")}</span>
               </div>
             </>
           )}
@@ -275,7 +488,16 @@ export function Settings({
             </span>
           </div>
           {importError && <div className="ai-theme-error">{importError}</div>}
-          {codexThemes.length === 0 ? (
+          {codexThemesLoading ? (
+            <div className="custom-themes-status">{t("theme.loading")}</div>
+          ) : codexThemesError ? (
+            <div className="custom-themes-status custom-themes-load-error">
+              <span>{t("theme.loadFailed", { error: codexThemesError })}</span>
+              <button className="ws-dialog-btn" onClick={() => setCodexThemesReload((value) => value + 1)}>
+                {t("theme.retry")}
+              </button>
+            </div>
+          ) : codexThemes.length === 0 ? (
             <div className="custom-themes-empty">
               {emptyBefore}
               <button className="link-btn" onClick={() => void openExternal(THEMES_SITE)}>
@@ -329,6 +551,120 @@ export function Settings({
               </div>
             </>
           )}
+
+          <div className="settings-section-title font-settings-title">{t("font.title")}</div>
+
+          <div className="font-setting">
+            <span>{t("font.family")}</span>
+            <div className="font-family-control">
+              <div className="font-family-picker">
+                <UsageSelect
+                  value={customFontFamily ? CUSTOM_FONT_FAMILY : fontConfig.family}
+                  width={240}
+                  options={[
+                    {
+                      value: DEFAULT_FONT_CONFIG.family,
+                      label: t("font.default", { font: FONT_FAMILY_PRESETS[0].label }),
+                    },
+                    ...FONT_FAMILY_PRESETS.slice(1),
+                    { value: CUSTOM_FONT_FAMILY, label: t("font.custom") },
+                  ]}
+                  onChange={(value) => {
+                    if (value === CUSTOM_FONT_FAMILY) {
+                      setCustomFontFamily(true);
+                      return;
+                    }
+                    const next = { ...fontConfig, family: value };
+                    setCustomFontFamily(false);
+                    setFontConfig(next);
+                    saveFontConfig(next);
+                    applyFontFamily(value);
+                  }}
+                />
+                <button
+                  className="font-size-reset"
+                  disabled={fontConfig.family === DEFAULT_FONT_CONFIG.family && !customFontFamily}
+                  onClick={() => {
+                    const next = { ...fontConfig, family: DEFAULT_FONT_CONFIG.family };
+                    setCustomFontFamily(false);
+                    setFontConfig(next);
+                    saveFontConfig(next);
+                    applyFontFamily(next.family);
+                  }}
+                >
+                  {t("font.reset")}
+                </button>
+              </div>
+              {customFontFamily && (
+                <input
+                  {...textInputProps}
+                  className="font-family-input"
+                  type="text"
+                  autoFocus
+                  placeholder={DEFAULT_FONT_CONFIG.family}
+                  value={fontConfig.family}
+                  onChange={(e) => {
+                    const next = { ...fontConfig, family: e.target.value };
+                    setFontConfig(next);
+                  }}
+                  onBlur={(e) => {
+                    const family = e.target.value.trim() || DEFAULT_FONT_CONFIG.family;
+                    const next = { ...fontConfig, family };
+                    setCustomFontFamily(!isPresetFontFamily(family));
+                    setFontConfig(next);
+                    saveFontConfig(next);
+                    applyFontFamily(family);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                  }}
+                />
+              )}
+            </div>
+          </div>
+
+          <div className="font-setting">
+            <span>{t("font.size")}</span>
+            <div className="font-size-control">
+              <button
+                className="font-size-btn"
+                disabled={fontConfig.size <= MIN_FONT_SIZE}
+                onClick={() => {
+                  const next = { ...fontConfig, size: fontConfig.size - 1 };
+                  setFontConfig(next);
+                  saveFontConfig(next);
+                  applyFontSize(next.size);
+                }}
+              >
+                −
+              </button>
+              <span className="font-size-value">{fontConfig.size}px</span>
+              <button
+                className="font-size-btn"
+                disabled={fontConfig.size >= MAX_FONT_SIZE}
+                onClick={() => {
+                  const next = { ...fontConfig, size: fontConfig.size + 1 };
+                  setFontConfig(next);
+                  saveFontConfig(next);
+                  applyFontSize(next.size);
+                }}
+              >
+                +
+              </button>
+              <button
+                className="font-size-reset"
+                disabled={fontConfig.size === DEFAULT_FONT_CONFIG.size}
+                onClick={() => {
+                  const next = { ...fontConfig, size: DEFAULT_FONT_CONFIG.size };
+                  setFontConfig(next);
+                  saveFontConfig(next);
+                  applyFontSize(next.size);
+                }}
+              >
+                {t("font.reset")}
+              </button>
+            </div>
+          </div>
           </>
           )}
           {section === "about" && (
@@ -358,6 +694,14 @@ export function Settings({
                         </div>
                       ) : updPhase === "restarting" ? (
                         <span className="update-status">{t("about.restarting")}</span>
+                      ) : updPhase === "waiting" ? (
+                        <span className="update-status">
+                          {t("about.waitingForTasks", { count: runningTasks })}
+                        </span>
+                      ) : updPhase === "ready" ? (
+                        <button className="update-btn" onClick={finishUpdate}>
+                          {t("about.restartReady")}
+                        </button>
                       ) : (
                         <button className="update-btn" onClick={applyUpdate}>
                           {t("about.updateRestart", { version: updateVersion })}

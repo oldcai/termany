@@ -9,11 +9,15 @@
     "test": "node --import tsx --test src/*.test.ts tests/*.test.ts"
   },
   "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.76.0",
+    "@agentclientprotocol/codex-acp": "1.11.0",
     "@agentclientprotocol/sdk": "^1.2.1",
     "@anthropic-ai/sdk": "^0.106.0",
     "node-pty": "^1.0.0",
+    "trzsz": "^1.1.6",
     "undici": "^8.5.0",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
     "@types/ws": "^8.5.13",

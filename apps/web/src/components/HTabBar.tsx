@@ -1,19 +1,26 @@
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { toggleWorkspaceSwitcher } from "../workspaceSwitcherEvents";
+import { textInputProps } from "../textInputProps";
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { beginDragCursor, createDragGhost, endDragCursor, type DragGhost } from "../dragGhost";
 import { isTauri } from "../env";
 import { useI18n } from "../i18n";
+import { useImeGuard } from "../imeGuard";
 import { withShortcut } from "../keybindings";
+import { closeBlockers } from "../closeGuard";
 import { useStore, activeNode, type Pane } from "../state/store";
+import { titleBarBackground, useTitleBarGesture } from "../titleBar";
 import {
   acknowledgeAgentActivities,
   agentActivitySummary,
+  agentActivitySummaryForSessions,
+  ownedSessionIds,
   agentActivitySnapshot,
   agentActivityTitle,
   subscribeAgentActivity,
   type AgentActivityStatus,
 } from "../terminal/manager";
 import { ChevronIcon, CloseIcon, PanelIcon, PanelRightIcon, PlusIcon } from "./icons";
+import { CloseConfirm } from "./CloseConfirm";
 
 /**
  * Top tab strip. Notion-style, the workspace controls sit at the very left,
@@ -28,6 +35,7 @@ const ACTIVITY_STATUSES = ["working", "done", "error"] as const;
 
 export function HTabBar() {
   const { t } = useI18n();
+  const ime = useImeGuard();
   const node = useStore(activeNode);
   const setActiveHTab = useStore((s) => s.setActiveHTab);
   const addHTab = useStore((s) => s.addHTab);
@@ -41,11 +49,20 @@ export function HTabBar() {
   const toggleRail = useStore((s) => s.toggleRail);
   const prevWorkspace = useStore((s) => s.prevWorkspace);
   const nextWorkspace = useStore((s) => s.nextWorkspace);
+  const botEnabled = useStore((s) => s.botEnabled);
+  const workspace = useStore((s) => s.workspaces.find((w) => w.id === s.activeWorkspace) ?? s.workspaces[0]);
   const solo = useStore((s) => s.workspaces.length < 2);
 
   const [editing, setEditing] = useState<string | null>(null);
+  const [pendingClose, setPendingClose] = useState<{
+    id: string;
+    title: string;
+    working: number;
+    error: number;
+  } | null>(null);
   const suppressClickRef = useRef(false);
   const stripRef = useRef<HTMLDivElement>(null);
+  const titleBar = useTitleBarGesture();
 
   // Keep the active tab on screen — a tab created past the right edge would
   // otherwise be active but invisible. `nearest` no-ops when it already is.
@@ -67,6 +84,9 @@ export function HTabBar() {
 
   const controls = (
     <div className="htab-controls">
+      {!botEnabled && collapsed && <button className="bar-btn" aria-label={workspace.title} title={workspace.title} onClick={toggleWorkspaceSwitcher}>
+        {workspace.icon ?? (workspace.title.trim().charAt(0).toUpperCase() || "?")}
+      </button>}
       <button
         className="bar-btn"
         title={withShortcut(t(collapsed ? "sidebar.show" : "sidebar.hide"), "toggleSidebar")}
@@ -82,15 +102,6 @@ export function HTabBar() {
       </button>
     </div>
   );
-
-  // The empty parts of the strip drag the window (desktop). Tabs/buttons are
-  // interactive, so clicks land on them, not the drag region. Double-clicking
-  // that same empty area zooms the window, macOS title-bar style — guarded to
-  // the bar itself so it doesn't fire from a bubbled tab/button dblclick.
-  const onBarDoubleClick = (e: React.MouseEvent) => {
-    if (!isTauri || e.target !== e.currentTarget) return;
-    void getCurrentWindow().toggleMaximize();
-  };
 
   const startTabDrag = (tabId: string, e: React.PointerEvent<HTMLDivElement>) => {
     if (!node || e.button !== 0 || editing === tabId) return;
@@ -167,13 +178,17 @@ export function HTabBar() {
     window.addEventListener("pointercancel", onUp);
   };
 
+  // The bar doubles as the window's title bar: its empty parts drag the window
+  // and zoom it on a double-click. Both background elements are marked, so the
+  // gesture covers the whole bar minus the tabs and buttons — the strip is
+  // flex: 1, and it alone accounts for nearly all of that empty space.
   return (
-    <div className={cls} data-tauri-drag-region onDoubleClick={onBarDoubleClick}>
+    <div className={cls} {...titleBar} {...titleBarBackground}>
       {controls}
       {/* Only the tabs scroll; the workspace controls and the panel toggle stay
           pinned to either end. Without this the strip just overflowed and a
           newly created tab sat off-screen, active but invisible. */}
-      <div className="htab-strip" ref={stripRef} data-tauri-drag-region>
+      <div className="htab-strip" ref={stripRef} {...titleBarBackground}>
       {node?.htabs.map((h) => (
         (() => {
           const ids = leafIds(h.layout);
@@ -216,16 +231,18 @@ export function HTabBar() {
               })}
               {editing === h.id ? (
                 <input
+                  {...textInputProps}
                   className="htab-rename"
                   autoFocus
                   defaultValue={h.title}
+                  {...ime.props}
                   onClick={(e) => e.stopPropagation()}
                   onBlur={(e) => {
                     renameHTab(h.id, e.target.value.trim() || h.title);
                     setEditing(null);
                   }}
                   onKeyDown={(e) => {
-                    if (e.nativeEvent.isComposing) return; // let the IME handle Enter/Esc
+                    if (ime.handled(e)) return; // the IME is still using this key
                     if (e.key === "Enter") (e.target as HTMLInputElement).blur();
                     else if (e.key === "Escape") setEditing(null);
                   }}
@@ -238,7 +255,11 @@ export function HTabBar() {
                     title={withShortcut(t("common.close"), "closePane")}
                     onClick={(e) => {
                       e.stopPropagation();
-                      closeHTab(h.id);
+                      const blockers = closeBlockers(
+                        agentActivitySummaryForSessions(ownedSessionIds(ids)),
+                      );
+                      if (blockers) setPendingClose({ id: h.id, title: h.title, ...blockers });
+                      else closeHTab(h.id);
                     }}
                   >
                     <CloseIcon />
@@ -267,6 +288,19 @@ export function HTabBar() {
       >
         <PanelRightIcon />
       </button>
+      {pendingClose && (
+        <CloseConfirm
+          kind="tab"
+          name={pendingClose.title}
+          working={pendingClose.working}
+          error={pendingClose.error}
+          onConfirm={() => {
+            closeHTab(pendingClose.id);
+            setPendingClose(null);
+          }}
+          onClose={() => setPendingClose(null)}
+        />
+      )}
     </div>
   );
 }

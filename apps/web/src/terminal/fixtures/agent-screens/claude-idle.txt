@@ -1,0 +1,40 @@
+
+╭─── Claude Code v2.1.220 ─────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting started                                        │
+│                 Welcome back Emily!                │ Run /init to create a CLAUDE.md file with instructions for Cla… │
+│                                                    │ ─────────────────────────────────────────────────────────────── │
+│                       ▐▛███▜▌                      │ What's new                                                      │
+│                      ▝▜█████▛▘                     │ Bug fixes and reliability improvements                          │
+│                        ▘▘ ▝▝                       │ Added Claude Opus 5 (`claude-opus-5`), now the default Opus mo… │
+│   Opus 5 (1M context) with max … · Claude Max ·    │ Added `sandbox.network.strictAllowlist` setting to deny non-al… │
+│   hi.emily.xiao@gmail.com's Organization           │ /release-notes for more                                         │
+│ /…/session/scratchpad │                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ⚠ 4 MCP servers need authentication · run /mcp
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                        ◈ max · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PERS…
+  [Opus 5 (1M context)] ░░░░░░░░░░ 0% | scratchpad | 费用 $0.0000
+  ⏵⏵ auto mode on (shift+tab to cycle)

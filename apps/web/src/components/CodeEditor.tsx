@@ -6,6 +6,7 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import { EditorView, keymap } from "@codemirror/view";
 import { basicSetup } from "codemirror";
 import { useEffect, useRef } from "react";
+import { applyTextInputProps } from "../textInputProps";
 
 /** Match the app's own chrome instead of CodeMirror's default white/dark-blue
  *  chrome, so the editor reads as part of the pane, not an embedded widget. */
@@ -105,5 +106,16 @@ export function CodeEditor({
     // CodeMirror's own state.
   }, [path, dark, readOnly]);
 
-  return <div className="code-editor" ref={hostRef} />;
+  return (
+    <div
+      className="code-editor"
+      ref={hostRef}
+      onFocusCapture={(event) => {
+        // CodeMirror creates its search/replace fields outside React.
+        if (event.target.matches("input, textarea, [contenteditable]")) {
+          applyTextInputProps(event.target);
+        }
+      }}
+    />
+  );
 }

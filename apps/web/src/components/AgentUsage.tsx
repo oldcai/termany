@@ -71,9 +71,7 @@ function tildify(p: string): string {
   return p.replace(/^\/(?:Users|home)\/[^/]+/, "~");
 }
 
-// "All" leads, matching the All agents / All projects dropdowns beside it.
 const RANGES = [
-  { key: "all", labelKey: "usage.range.all" },
   { key: "today", labelKey: "usage.range.today" },
   { key: "week", labelKey: "usage.range.week" },
   { key: "month", labelKey: "usage.range.month" },
@@ -81,42 +79,43 @@ const RANGES = [
 
 type RangeKey = (typeof RANGES)[number]["key"];
 
-/** First local date included in the range ("" = no lower bound). */
 function rangeCutoff(range: RangeKey): string {
-  if (range === "all") return "";
   const d = new Date();
   if (range === "week") d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); // back to Monday
   else if (range === "month") d.setDate(1);
   return localDateString(d);
 }
 
-const MAX_CHART_DAYS = 120;
+const MAX_CHART_DAYS = 31;
 
 /**
  * Agent token-usage dashboard (the SideRail chart button): totals + estimated
  * cost cards, a daily input/output bar chart, and a per-model breakdown, all
- * computed client-side from /api/agent-usage (daily per-agent/per-model rows
- * parsed out of each CLI's on-disk transcripts). Cache tokens are shown in the
- * cards and cost but excluded from the chart — they'd dwarf everything else.
+ * computed client-side from range-bounded /api/agent-usage rows. Cache tokens
+ * are shown in the cards and cost but excluded from the chart — they'd dwarf
+ * everything else.
  */
-export function AgentUsage({ onClose }: { onClose: () => void }) {
+export function AgentUsage() {
   const { t } = useI18n();
   const agentConfigs = useAgentConfigs();
   const [rows, setRows] = useState<UsageRow[] | null | undefined>(undefined);
   const [stale, setStale] = useState(false);
-  const [range, setRange] = useState<RangeKey>("month");
+  const [range, setRange] = useState<RangeKey>("today");
   const [agent, setAgent] = useState("all");
   const [project, setProject] = useState("all");
 
   useEffect(() => {
     let cancelled = false;
-    fetch(apiPath("/api/agent-usage"))
+    const abort = new AbortController();
+    setRows(undefined);
+    const params = new URLSearchParams({ since: rangeCutoff(range) });
+    fetch(apiPath(`/api/agent-usage?${params}`), { signal: abort.signal })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
       .then((data) => {
         if (!cancelled) setRows(Array.isArray(data.rows) ? data.rows : []);
       })
       .catch((e: Error) => {
-        if (cancelled) return;
+        if (cancelled || e.name === "AbortError") return;
         // A 404 on a route this build ships means the backend answering us is
         // older than the UI — an upgrade left the previous release's server
         // holding the port. Say so instead of blaming the data.
@@ -125,16 +124,9 @@ export function AgentUsage({ onClose }: { onClose: () => void }) {
       });
     return () => {
       cancelled = true;
+      abort.abort();
     };
-  }, []);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [range]);
 
   const agentIds = useMemo(
     () => [...new Set((rows ?? []).map((r) => r.agent))].sort(),
@@ -200,9 +192,8 @@ export function AgentUsage({ onClose }: { onClose: () => void }) {
       d.output += r.output;
       byDate.set(r.date, d);
     }
-    // The chart always ends today and starts at the range cutoff (or the
-    // earliest recorded day for "All").
-    const cutoff = rangeCutoff(range) || [...byDate.keys()].sort()[0];
+    // The chart always ends today and starts at the selected range cutoff.
+    const cutoff = rangeCutoff(range);
     if (!cutoff) return [];
     const span = Math.floor((Date.now() - new Date(`${cutoff}T00:00:00`).getTime()) / 86400000) + 1;
     const count = Math.min(Math.max(span, 1), MAX_CHART_DAYS);
@@ -275,8 +266,7 @@ export function AgentUsage({ onClose }: { onClose: () => void }) {
   ];
 
   return (
-    <div className="search-backdrop" onClick={onClose}>
-      <div className="usage-modal" onClick={(e) => e.stopPropagation()}>
+    <div className="usage-pane">
         <div className="usage-header">
           <span className="usage-title">
             <ChartIcon />
@@ -413,7 +403,6 @@ export function AgentUsage({ onClose }: { onClose: () => void }) {
             </div>
           </div>
         )}
-      </div>
     </div>
   );
 }

@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useI18n } from "../i18n";
+import { useNativeOccluder } from "../nativeViewOcclusion";
 import { useStore } from "../state/store";
-import { EmojiPicker } from "./EmojiPicker";
-import { ChevronIcon, EditIcon, GearIcon, PlusIcon, TrashIcon } from "./icons";
+import { TOGGLE_WORKSPACE_SWITCHER_EVENT } from "../workspaceSwitcherEvents";
+import { EditIcon, GearIcon, PlusIcon, TrashIcon } from "./icons";
 import { WorkspaceDialog } from "./WorkspaceDialog";
 
 const initial = (t: string) => t.trim().charAt(0).toUpperCase() || "?";
@@ -10,12 +11,12 @@ const initial = (t: string) => t.trim().charAt(0).toUpperCase() || "?";
 type DialogState = { mode: "new" } | { mode: "edit"; id: string; title: string; icon?: string };
 
 /**
- * Notion-style workspace header at the top of the sidebar: [icon] [name ▾].
- * The dropdown switches workspaces, edits them (hover → pencil), creates new
- * ones (via a name/icon dialog), and opens Settings.
+ * Shared workspace menu for the app rail, Pages sidebar, and collapsed header.
  */
 export function WorkspaceSwitcher({ onOpenSettings }: { onOpenSettings: () => void }) {
   const { t } = useI18n();
+  const botEnabled = useStore((s) => s.botEnabled);
+  const sidebarCollapsed = useStore((s) => s.sidebarCollapsed);
   const workspaces = useStore((s) => s.workspaces);
   const activeId = useStore((s) => s.activeWorkspace);
   const setActiveWorkspace = useStore((s) => s.setActiveWorkspace);
@@ -27,11 +28,16 @@ export function WorkspaceSwitcher({ onOpenSettings }: { onOpenSettings: () => vo
   const updateVersion = useStore((s) => s.updateVersion);
 
   const [menuOpen, setMenuOpen] = useState(false);
-  const [emojiOpen, setEmojiOpen] = useState(false);
   const [dialog, setDialog] = useState<DialogState | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
+  const menuRef = useNativeOccluder<HTMLDivElement>("workspace-switcher-menu", menuOpen);
+  const deleteBackdropRef = useNativeOccluder<HTMLDivElement>("workspace-delete", deleteTarget !== null);
 
-  const active = workspaces.find((w) => w.id === activeId) ?? workspaces[0];
+  useEffect(() => {
+    const toggleFromRail = () => setMenuOpen((open) => !open);
+    window.addEventListener(TOGGLE_WORKSPACE_SWITCHER_EVENT, toggleFromRail);
+    return () => window.removeEventListener(TOGGLE_WORKSPACE_SWITCHER_EVENT, toggleFromRail);
+  }, []);
 
   const avatar = (w: { icon?: string; title: string }, sm = false) =>
     w.icon ? (
@@ -41,34 +47,11 @@ export function WorkspaceSwitcher({ onOpenSettings }: { onOpenSettings: () => vo
     );
 
   return (
-    <div className="ws-switcher">
-      <div className="ws-head" data-tauri-drag-region>
-        <button className="ws-icon-btn" title={t("workspace.changeIcon")} onClick={() => setEmojiOpen((o) => !o)}>
-          {avatar(active)}
-        </button>
-        <button className="ws-name-btn" onClick={() => setMenuOpen((o) => !o)}>
-          <span className="ws-name">{active.title}</span>
-          <span className="ws-chevron">
-            <ChevronIcon dir="down" />
-          </span>
-          {updateVersion && <span className="update-dot" title={t("workspace.updateAvailable", { version: updateVersion })} />}
-        </button>
-      </div>
-
-      {emojiOpen && (
-        <EmojiPicker
-          onPick={(emoji) => {
-            setWorkspaceIcon(active.id, emoji);
-            setEmojiOpen(false);
-          }}
-          onClose={() => setEmojiOpen(false)}
-        />
-      )}
-
+    <div className={`workspace-menu-host${botEnabled ? "" : " terminal-workspace-menu"}${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
       {menuOpen && (
         <>
           <div className="ws-backdrop" onClick={() => setMenuOpen(false)} />
-          <div className="ws-menu">
+          <div className="ws-menu" ref={menuRef}>
             {workspaces.map((w) => (
               <div className="ws-menu-item" key={w.id}>
                 <button
@@ -161,7 +144,7 @@ export function WorkspaceSwitcher({ onOpenSettings }: { onOpenSettings: () => vo
       )}
 
       {deleteTarget && (
-        <div className="ws-dialog-backdrop" onClick={() => setDeleteTarget(null)}>
+        <div className="ws-dialog-backdrop" ref={deleteBackdropRef} onClick={() => setDeleteTarget(null)}>
           <div className="ws-dialog" onClick={(e) => e.stopPropagation()}>
             <p className="quit-confirm-text">
               {t("workspace.deleteConfirm", { name: deleteTarget.title })}

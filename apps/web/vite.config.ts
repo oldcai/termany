@@ -7,7 +7,23 @@ import { defineConfig } from "vite";
 const coreSrc = fileURLToPath(new URL("../../packages/core/src", import.meta.url));
 
 export default defineConfig(({ command }) => ({
-  plugins: [react()],
+  plugins: [
+    react(),
+    {
+      name: "termany-state-full-reload",
+      handleHotUpdate(ctx) {
+        // The Zustand store is a process-local singleton. Hot-swapping this
+        // module creates a fresh store with the fallback `ws 1` workspace while
+        // main.tsx (and therefore SQLite hydration) does not run again. Reload
+        // the document for state-layer edits so startup rehydrates the real
+        // workspaces before the UI is painted.
+        if (/[\\/]src[\\/]state[\\/](store|sync)\.ts$/.test(ctx.file)) {
+          ctx.server.ws.send({ type: "full-reload", path: "*" });
+          return [];
+        }
+      },
+    },
+  ],
   resolve: {
     alias: {
       "@termany/core": coreSrc,

@@ -1,25 +1,42 @@
+import { textInputProps } from "../textInputProps";
 import { Fragment, useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
 import { createPortal } from "react-dom";
 import { beginDragCursor, createDragGhost, endDragCursor } from "../dragGhost";
 import { useI18n } from "../i18n";
+import { useImeGuard } from "../imeGuard";
 import { registerOccluder, unregisterOccluder } from "../nativeViewOcclusion";
 import { withShortcut } from "../keybindings";
+import { closeBlockers } from "../closeGuard";
 import { activeHtab, paneCount, useStore, type DropEdge, type HTab, type Pane } from "../state/store";
 import {
   acknowledgeAgentActivities,
   aggregateAgentActivity,
   agentActivitySnapshot,
+  agentActivitySummaryForSessions,
   agentActivityTitle,
-  focusSession,
+  ownedSessionIds,
+  reconcileTerminalFocus,
   subscribeAgentActivity,
   terminalSessionId,
 } from "../terminal/manager";
-import { servedUrls, subscribeServedUrls } from "../terminal/servedUrls";
+import {
+  cancelServedUrlForward,
+  forwardServedUrl,
+  servedUrlBrowserUrl,
+  servedUrls,
+  subscribeServedUrls,
+  type ServedUrl,
+} from "../terminal/servedUrls";
 import { openExternal } from "../openExternal";
+import { CloseConfirm } from "./CloseConfirm";
+import { AgentHistory } from "./AgentHistory";
+import { AgentUsage } from "./AgentUsage";
+import { ProviderPane } from "./ProviderPane";
 import { FileTree } from "./FileTree";
 import { GitDiffView } from "./GitDiffView";
 import {
   ActivityIcon,
+  ChartIcon,
   ChatIcon,
   CheckIcon,
   ChevronIcon,
@@ -27,8 +44,11 @@ import {
   ExternalOpenIcon,
   FilesIcon,
   GitBranchIcon,
+  HistoryIcon,
   MaximizeIcon,
+  ProviderIcon,
   RestoreIcon,
+  SpinnerIcon,
   TerminalIcon,
   WebIcon,
 } from "./icons";
@@ -50,6 +70,18 @@ function findLeaf(pane: Pane, id: string): Leaf | undefined {
   return undefined;
 }
 
+/**
+ * Structure-only identity for focus reconciliation. Split sizes deliberately
+ * stay out so divider dragging does not refocus on every frame; changes that
+ * can remount a PaneSlot (split/collapse/reorder/view/SSH) remain visible.
+ */
+function focusTopologyKey(pane: Pane): string {
+  if (pane.kind === "leaf") {
+    return JSON.stringify([pane.id, pane.view ?? "terminal", pane.sshTarget ?? ""]);
+  }
+  return `${pane.dir}(${pane.children.map(focusTopologyKey).join(",")})`;
+}
+
 /** Pick the nearest edge of a rect for the given cursor point. */
 function edgeFor(rect: DOMRect, x: number, y: number): DropEdge {
   const rx = (x - rect.left) / rect.width;
@@ -65,6 +97,9 @@ const PANE_VIEWS = [
   { view: "agent", labelKey: "pane.view.agent", Icon: ChatIcon },
   { view: "web", labelKey: "pane.view.web", Icon: WebIcon },
   { view: "monitor", labelKey: "pane.view.monitor", Icon: ActivityIcon },
+  { view: "providers", labelKey: "pane.view.providers", Icon: ProviderIcon },
+  { view: "history", labelKey: "pane.view.history", Icon: HistoryIcon },
+  { view: "usage", labelKey: "pane.view.usage", Icon: ChartIcon },
 ] as const;
 
 /** Dismiss-on-outside-click/Escape plus native-view occlusion, shared by the
@@ -103,14 +138,16 @@ function usePaneHeadPopover(open: boolean, close: () => void) {
 }
 
 /**
- * "Open what this pane is serving" — shown only while the pane's own process
- * tree is actually listening on a TCP port (see terminal/servedUrls). One
+ * "Open what this pane is serving" — local listeners come from the pane's
+ * process tree; SSH listeners come from its authenticated remote. One
  * candidate opens on click; several drop down so the right dev server can be
- * picked.
+ * picked, forwarded, or closed.
  */
 function PaneServedUrls({ leaf }: { leaf: Leaf }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
+  const [busyPort, setBusyPort] = useState<number | null>(null);
+  const [error, setError] = useState("");
   const close = useCallback(() => setOpen(false), []);
   const { rootRef, panelRef } = usePaneHeadPopover(open, close);
   const sessionId = terminalSessionId(leaf.id, leaf.sshTarget);
@@ -121,57 +158,109 @@ function PaneServedUrls({ leaf }: { leaf: Leaf }) {
   const snapshot = useCallback(() => servedUrls(sessionId), [sessionId]);
   const urls = useSyncExternalStore(subscribe, snapshot, snapshot);
 
-  const launch = (url: string) => {
-    setOpen(false);
-    void openExternal(url).then((error) => {
-      if (error) console.warn("[termany] failed to open URL:", error);
-    });
+  const launch = async (entry: ServedUrl) => {
+    setBusyPort(entry.port);
+    setError("");
+    try {
+      const url = await forwardServedUrl(sessionId, entry);
+      setOpen(false);
+      const openError = await openExternal(url);
+      if (openError) throw new Error(openError);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      setOpen(true);
+    } finally {
+      setBusyPort(null);
+    }
+  };
+
+  const cancelForward = async (entry: ServedUrl) => {
+    setBusyPort(entry.port);
+    setError("");
+    try {
+      await cancelServedUrlForward(sessionId, entry);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusyPort(null);
+    }
   };
 
   if (!urls.length) return null;
   const primary = urls[0];
+  const hasMenu = urls.length > 1 || urls.some((entry) => entry.localPort);
   return (
     <div className="pane-view-menu pane-url-menu" ref={rootRef}>
       <button
         className="pane-btn pane-url-btn"
         title={
-          urls.length > 1
+          hasMenu
             ? t("pane.servedUrls")
-            : t("pane.openInBrowser", { url: primary.url })
+            : t("pane.openInBrowser", { url: servedUrlBrowserUrl(primary) })
         }
-        aria-haspopup={urls.length > 1 ? "menu" : undefined}
-        aria-expanded={urls.length > 1 ? open : undefined}
-        onClick={() => (urls.length > 1 ? setOpen((was) => !was) : launch(primary.url))}
+        aria-haspopup={hasMenu || error ? "menu" : undefined}
+        aria-expanded={hasMenu || error ? open : undefined}
+        disabled={busyPort === primary.port}
+        onClick={() => (hasMenu ? setOpen((was) => !was) : void launch(primary))}
       >
-        <WebIcon />
-        <span className="pane-url-port">{primary.port}</span>
-        {urls.length > 1 && <ChevronIcon dir="down" />}
+        {busyPort === primary.port ? <SpinnerIcon /> : <WebIcon />}
+        <span className="pane-url-port">
+          {primary.localPort ? `${primary.port}→${primary.localPort}` : primary.port}
+        </span>
+        {hasMenu && <ChevronIcon dir="down" />}
       </button>
-      {open && (
+      {open && (hasMenu || error) && (
         <div className="pop-panel pane-view-panel pane-url-panel" role="menu" ref={panelRef}>
           {urls.map((entry) => (
-            <button
-              key={entry.port}
-              type="button"
-              role="menuitem"
-              className="pop-item"
-              onClick={() => launch(entry.url)}
-            >
-              <ExternalOpenIcon />
-              <span className="pop-item-label">{entry.url}</span>
-            </button>
+            <div className="pane-port-row" key={entry.port}>
+              <button
+                type="button"
+                role="menuitem"
+                className="pop-item pane-port-open"
+                disabled={busyPort === entry.port}
+                onClick={() => void launch(entry)}
+              >
+                {busyPort === entry.port ? (
+                  <SpinnerIcon />
+                ) : entry.localPort ? (
+                  <CheckIcon />
+                ) : (
+                  <ExternalOpenIcon />
+                )}
+                <span className="pop-item-label">
+                  {entry.remote
+                    ? entry.localPort
+                      ? `ssh:${entry.port} → localhost:${entry.localPort}`
+                      : `ssh:${entry.port}`
+                    : entry.url}
+                </span>
+              </button>
+              {entry.remote && entry.localPort && (
+                <button
+                  type="button"
+                  className="pane-port-cancel"
+                  title={t("common.close")}
+                  aria-label={t("common.close")}
+                  disabled={busyPort === entry.port}
+                  onClick={() => void cancelForward(entry)}
+                >
+                  <CloseIcon />
+                </button>
+              )}
+            </div>
           ))}
+          {error && <div className="pane-port-error">{error}</div>}
         </div>
       )}
     </div>
   );
 }
 
-/** Header dropdown switching this pane between all four pane views — the same
- *  order ⌘E cycles through. */
+/** Header dropdown switching this pane between every available pane view. */
 function PaneViewMenu({ leaf }: { leaf: Leaf }) {
   const { t } = useI18n();
   const setPaneView = useStore((s) => s.setPaneView);
+  const railVisibility = useStore((s) => s.railVisibility);
   const [open, setOpen] = useState(false);
   const close = useCallback(() => setOpen(false), []);
   const { rootRef, panelRef } = usePaneHeadPopover(open, close);
@@ -180,7 +269,7 @@ function PaneViewMenu({ leaf }: { leaf: Leaf }) {
   const CurrentIcon = PANE_VIEWS.find((entry) => entry.view === current)!.Icon;
   const availableViews = leaf.sshTarget
     ? PANE_VIEWS.filter((entry) => entry.view === "terminal")
-    : PANE_VIEWS;
+    : PANE_VIEWS.filter((entry) => railVisibility[entry.view]);
   return (
     <div className="pane-view-menu" ref={rootRef}>
       <button
@@ -233,6 +322,8 @@ function PaneHeader({
   const closePane = useStore((s) => s.closePane);
   const toggleMaximize = useStore((s) => s.toggleMaximize);
   const [editing, setEditing] = useState(false);
+  const [pendingClose, setPendingClose] = useState<{ working: number; error: number } | null>(null);
+  const ime = useImeGuard();
   const renameWidth = `${Math.max(8, leaf.title.length + 1)}ch`;
   useSyncExternalStore(
     subscribeAgentActivity,
@@ -273,17 +364,19 @@ function PaneHeader({
           />
         ) : editing ? (
           <input
+            {...textInputProps}
             className="pane-head-rename"
             style={{ width: renameWidth }}
             autoFocus
             defaultValue={leaf.title}
+            {...ime.props}
             onClick={(e) => e.stopPropagation()}
             onBlur={(e) => {
               renamePane(leaf.id, e.target.value.trim() || leaf.title);
               setEditing(false);
             }}
             onKeyDown={(e) => {
-              if (e.nativeEvent.isComposing) return; // let the IME handle Enter/Esc
+              if (ime.handled(e)) return; // the IME is still using this key
               if (e.key === "Enter") (e.target as HTMLInputElement).blur();
               else if (e.key === "Escape") setEditing(false);
             }}
@@ -311,12 +404,38 @@ function PaneHeader({
           <button
             className="pane-btn"
             title={withShortcut("Close pane", "closePane")}
-            onClick={() => closePane(leaf.id)}
+            // Don't let the slot's mousedown focus a pane we're about to close:
+            // it would make closing ANY pane look like closing the focused one,
+            // and focus would leave the pane the user was actually working in.
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+            onClick={() => {
+              const blockers = closeBlockers(
+                agentActivitySummaryForSessions(ownedSessionIds([leaf.id])),
+              );
+              if (blockers) setPendingClose(blockers);
+              else closePane(leaf.id);
+            }}
           >
             <CloseIcon />
           </button>
         )}
       </div>
+      {pendingClose && (
+        <CloseConfirm
+          kind="pane"
+          name={leaf.title}
+          working={pendingClose.working}
+          error={pendingClose.error}
+          onConfirm={() => {
+            closePane(leaf.id);
+            setPendingClose(null);
+          }}
+          onClose={() => setPendingClose(null)}
+        />
+      )}
     </div>
   );
 }
@@ -342,22 +461,33 @@ function PaneSlot({
   const setFocusedPane = useStore((s) => s.setFocusedPane);
   const setPaneWebUrl = useStore((s) => s.setPaneWebUrl);
   const dropEdge = dropTarget?.id === leaf.id ? dropTarget.edge : null;
+  const isTerminal = (leaf.view ?? "terminal") === "terminal";
 
   useEffect(() => {
-    if (focused) {
-      focusSession(leaf.id);
-      acknowledgeAgentActivities([leaf.id]);
-    }
+    if (focused) acknowledgeAgentActivities([leaf.id]);
   }, [focused, leaf.id]);
+
+  const focusPane = () => {
+    // Update the one canonical state first; the ring and every later focus
+    // reconciliation now point at the same pane. The direct terminal focus is
+    // needed even when this pane was already selected (e.g. after a header
+    // control temporarily owned DOM focus).
+    setFocusedPane(leaf.id);
+    if (isTerminal) reconcileTerminalFocus(leaf.id);
+    acknowledgeAgentActivities([leaf.id]);
+  };
 
   return (
     <div
       data-pane-id={leaf.id}
-      className={`pane-slot ${showFocus && focused ? "focused" : ""}`}
-      onMouseDown={() => {
-        setFocusedPane(leaf.id);
-        acknowledgeAgentActivities([leaf.id]);
-      }}
+      // `focused` always mirrors the canonical store state. Whether a ring is
+      // useful is a separate presentation concern (single/zen panes omit it).
+      className={`pane-slot${focused ? " focused" : ""}${showFocus ? " show-focus-ring" : ""}`}
+      onMouseDown={focusPane}
+      // Keyboard navigation and child auto-focus can enter a pane without a
+      // mouse event. Feed that fact back into the same canonical state so the
+      // ring can never stay behind in another pane.
+      onFocusCapture={() => setFocusedPane(leaf.id)}
     >
       <PaneHeader
         leaf={leaf}
@@ -377,14 +507,21 @@ function PaneSlot({
           <GitDiffView session={leaf.cwdFrom ?? leaf.id} variant="pane" viewId={leaf.id} />
         ) : leaf.view === "monitor" ? (
           <SystemMonitor />
+        ) : leaf.view === "history" ? (
+          <AgentHistory autoFocus={focused} />
+        ) : leaf.view === "usage" ? (
+          <AgentUsage />
+        ) : leaf.view === "providers" ? (
+          <ProviderPane />
         ) : leaf.view === "web" ? (
           <WebBrowserPane
             id={leaf.id}
             initialUrl={leaf.webUrl}
             onUrlChange={(url) => setPaneWebUrl(leaf.id, url)}
+            focused={focused}
           />
         ) : leaf.view === "agent" ? (
-          <AgentPane leaf={leaf} />
+          <AgentPane leaf={leaf} focused={focused} />
         ) : (
           <TerminalPane id={leaf.id} sshTarget={leaf.sshTarget} />
         )}
@@ -605,6 +742,19 @@ export function SplitView({ htab }: { htab: HTab }) {
   const newHTabDropRef = useRef(false);
   // Dropped on a sidebar page row → new tab on that page.
   const nodeDropTargetRef = useRef<string | null>(null);
+  const focusedLeaf = htab.focused ? findLeaf(htab.layout, htab.focused) : undefined;
+  const focusedTerminalId =
+    focusedLeaf && (focusedLeaf.view ?? "terminal") === "terminal" ? focusedLeaf.id : undefined;
+  const focusTopology = focusTopologyKey(htab.layout);
+
+  // TerminalPane attaches sessions in child effects before this parent effect
+  // runs. Reconcile from canonical focus after every tab/topology/zoom change;
+  // individual PaneSlots must not race focus against blur. The topology key
+  // also covers closing an unfocused sibling, where the focused id stays the
+  // same but React may remount its surviving PaneSlot while collapsing splits.
+  useEffect(() => {
+    reconcileTerminalFocus(focusedTerminalId);
+  }, [htab.id, htab.maximized, focusedTerminalId, focusTopology]);
 
   const updateDropTarget = (next: PaneDropTarget) => {
     dropTargetRef.current = next;

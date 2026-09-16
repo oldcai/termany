@@ -1,4 +1,6 @@
+import { textInputProps } from "../textInputProps";
 import { useEffect, useRef, useState } from "react";
+import { useImeGuard } from "../imeGuard";
 import { clearSessionSearch, findInSession, focusSession, onSearchResults } from "../terminal/manager";
 import { ChevronIcon, CloseIcon, SearchIcon } from "./icons";
 
@@ -9,6 +11,7 @@ import { ChevronIcon, CloseIcon, SearchIcon } from "./icons";
  * back to the shell, so ⌘F → type → Esc leaves the terminal exactly as it was.
  */
 export function FindBar({ sessionId, onClose }: { sessionId: string; onClose: () => void }) {
+  const ime = useImeGuard();
   const [query, setQuery] = useState("");
   const [misses, setMisses] = useState(false);
   const [hits, setHits] = useState({ index: -1, count: 0 });
@@ -43,18 +46,16 @@ export function FindBar({ sessionId, onClose }: { sessionId: string; onClose: ()
         <SearchIcon />
       </span>
       <input
+        {...textInputProps}
         ref={inputRef}
         className={`find-bar-input ${misses ? "miss" : ""}`}
         autoFocus
-        autoCorrect="off"
-        autoComplete="off"
-        autoCapitalize="off"
-        spellCheck={false}
         placeholder="Find in terminal…"
+        {...ime.props}
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={(e) => {
-          if (e.nativeEvent.isComposing) return;
+          if (ime.handled(e)) return;
           if (e.key === "Escape") close();
           else if (e.key === "Enter") {
             e.preventDefault();

@@ -1,27 +1,36 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { AgentHistory } from "./components/AgentHistory";
+import { CloseConfirm } from "./components/CloseConfirm";
 import { FindBar } from "./components/FindBar";
 import { GitDiff } from "./components/GitDiff";
-import { AgentUsage } from "./components/AgentUsage";
 import { HTabBar } from "./components/HTabBar";
+import { AgentWorkspace } from "./components/AgentWorkspace";
+import { AppTabRail, type AppTab } from "./components/AppTabRail";
 import { QuitConfirm } from "./components/QuitConfirm";
 import { ResizeHandles } from "./components/ResizeHandles";
 import { SearchPalette } from "./components/SearchPalette";
 import { Settings, type SettingsSection } from "./components/Settings";
+import { fetchSystemUsername } from "./userProfile";
 import { SideRail } from "./components/SideRail";
 import { SplitView } from "./components/SplitView";
 import { TreeSidebar } from "./components/TreeSidebar";
 import { WindowControls } from "./components/WindowControls";
+import { WorkspaceSwitcher } from "./components/WorkspaceSwitcher";
 import { isTauri } from "./env";
 import { ACTIONS, matchChord } from "./keybindings";
-import { activeHtab, activeNode, focusedCwdSession, leafIds, useStore } from "./state/store";
+import { closeBlockers, isCloseConfirmOpen } from "./closeGuard";
+import { activeHtab, activeNode, findLeaf, focusedCwdSession, leafIds, useStore } from "./state/store";
+import { openNewWindow } from "./state/windows";
 import {
   adjustTerminalFontSize,
+  agentActivitySummaryForSessions,
+  ownedSessionIds,
   clearSession,
+  queueCommandWhenShellReady,
   repeatFind,
   resetTerminalFontSize,
   scrollSessionToBottom,
   scrollSessionToTop,
+  subscribeShellNaturalExit,
 } from "./terminal/manager";
 import { openLocalPathsInFocusedSession } from "./terminal/openLocalPath";
 import { checkForUpdate } from "./updater";
@@ -74,6 +83,16 @@ const TREE_NAVIGATION_ACTION_IDS = new Set([
   "exitPage",
 ]);
 
+const APP_TAB_STORAGE_KEY = "termany.app-tab";
+
+function loadAppTab(): AppTab {
+  try {
+    return localStorage.getItem(APP_TAB_STORAGE_KEY) === "agents" ? "agents" : "pages";
+  } catch {
+    return "pages";
+  }
+}
+
 /** Preserve native macOS cursor movement everywhere except xterm's hidden input. */
 function isTextEditingTarget(target: EventTarget | null): boolean {
   const element = target instanceof Element ? target : document.activeElement;
@@ -84,23 +103,81 @@ function isTextEditingTarget(target: EventTarget | null): boolean {
 
 export function App() {
   const htab = useStore(activeHtab);
+  const activeWorkspaceId = useStore((state) => state.activeWorkspace);
+  const botEnabled = useStore((state) => state.botEnabled);
+  const [selectedAppTab, setAppTab] = useState<AppTab>(loadAppTab);
+  const appTab = botEnabled ? selectedAppTab : "pages";
+  useEffect(() => {
+    if (!botEnabled) setAppTab("pages");
+  }, [botEnabled]);
+  const appTabRef = useRef(appTab);
+  appTabRef.current = appTab;
   const collapsed = useStore((s) => s.sidebarCollapsed);
   const railCollapsed = useStore((s) => s.railCollapsed);
   const [settingsSection, setSettingsSection] = useState<SettingsSection | null>(null);
+  const [settingsAgentId, setSettingsAgentId] = useState<string | null>(null);
   // Where Settings was left when it closed, so the next plain "open settings"
   // lands there instead of snapping back to General. Entry points that target a
   // specific pane (the agents menu) still win, and update this in turn.
   const lastSettingsSection = useRef<SettingsSection>("general");
-  const openSettings = useCallback(() => setSettingsSection(lastSettingsSection.current), []);
+  const openSettings = useCallback(() => {
+    setSettingsAgentId(null);
+    setSettingsSection(lastSettingsSection.current);
+  }, []);
   const [searchOpen, setSearchOpen] = useState(false);
   const [agentsOpen, setAgentsOpen] = useState(false);
-  const [claudeHistoryOpen, setClaudeHistoryOpen] = useState(false);
-  const [agentUsageOpen, setAgentUsageOpen] = useState(false);
   const [gitDiffOpen, setGitDiffOpen] = useState(false);
   const [findOpen, setFindOpen] = useState(false);
+  // Cmd+W / palette close on a working or errored pane waits here for the
+  // dialog's verdict instead of closing immediately. The close-X buttons in
+  // HTabBar / TreeSidebar / SplitView each keep their own equivalent.
+  const [pendingPaneClose, setPendingPaneClose] = useState<{
+    id: string;
+    title: string;
+    working: number;
+    error: number;
+  } | null>(null);
   const settingsOpen = settingsSection !== null;
   const focusedPane = htab?.focused;
   const gitSession = useStore(focusedCwdSession);
+  const userNickname = useStore((state) => state.userProfile.nickname);
+  const setUserProfile = useStore((state) => state.setUserProfile);
+
+  const handleAppTabChange = useCallback((next: AppTab) => {
+    setAppTab(next);
+    // The command palette searches Pages resources and exposes pane commands;
+    // do not carry an open palette into the Bots workspace.
+    if (next !== "pages") setSearchOpen(false);
+  }, []);
+
+  const installAgent = useCallback((agentName: string, command: string) => {
+    const paneId = useStore.getState().addPane("terminal", `${agentName} Install`);
+    if (!paneId) return false;
+    queueCommandWhenShellReady(paneId, command);
+    handleAppTabChange("pages");
+    setSettingsSection(null);
+    setSettingsAgentId(null);
+    return true;
+  }, [handleAppTabChange]);
+
+  useEffect(() => {
+    if (userNickname.trim()) return;
+    let active = true;
+    void fetchSystemUsername().then((nickname) => {
+      if (active && nickname && !useStore.getState().userProfile.nickname.trim()) {
+        setUserProfile({ nickname });
+      }
+    });
+    return () => { active = false; };
+  }, [setUserProfile, userNickname]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(APP_TAB_STORAGE_KEY, appTab);
+    } catch {
+      // A locked-down browser can deny storage; the current window still works.
+    }
+  }, [appTab]);
 
   // The find bar targets one pane; if focus moves elsewhere, it would be
   // searching a terminal the user is no longer looking at — close it instead.
@@ -110,7 +187,9 @@ export function App() {
   // footers ask for a section over an event rather than a threaded-down prop.
   useEffect(() => {
     const onOpen = (event: Event) => {
-      const section = (event as CustomEvent<SettingsSection>).detail;
+      const detail = (event as CustomEvent<SettingsSection | { section: SettingsSection; agentId?: string }>).detail;
+      const section = typeof detail === "string" ? detail : detail.section;
+      setSettingsAgentId(typeof detail === "string" ? null : detail.agentId ?? null);
       lastSettingsSection.current = section;
       setSettingsSection(section);
     };
@@ -118,18 +197,19 @@ export function App() {
     return () => window.removeEventListener("termany:open-settings", onOpen);
   }, []);
 
+  useEffect(() => {
+    const onOpenPages = () => handleAppTabChange("pages");
+    window.addEventListener("termany:open-pages", onOpenPages);
+    return () => window.removeEventListener("termany:open-pages", onOpenPages);
+  }, [handleAppTabChange]);
+
   // Settings and Search are full-panel overlays, so blanket-hiding every
   // native webview in the workspace while either is open is correct. The
   // SideRail agent-menu dropdown is small and floating, not full-panel — it
   // registers its own rect via nativeViewOcclusion instead, so it only
   // blanks the pane(s) it actually overlaps (see SideRail.tsx).
   useEffect(() => {
-    const suppressed =
-      settingsOpen ||
-      searchOpen ||
-      claudeHistoryOpen ||
-      agentUsageOpen ||
-      gitDiffOpen;
+    const suppressed = appTab !== "pages" || settingsOpen || searchOpen || gitDiffOpen;
     document.body.classList.toggle("native-webviews-suppressed", suppressed);
     window.dispatchEvent(
       new CustomEvent("termany:native-webviews-suppressed", { detail: suppressed }),
@@ -140,7 +220,7 @@ export function App() {
         new CustomEvent("termany:native-webviews-suppressed", { detail: false }),
       );
     };
-  }, [settingsOpen, searchOpen, claudeHistoryOpen, agentUsageOpen, gitDiffOpen]);
+  }, [appTab, settingsOpen, searchOpen, gitDiffOpen]);
 
   // What every bindable action DOES. The catalog itself (ids, labels, default
   // chords) lives in keybindings.ts; this is the other half. Two things drive
@@ -149,7 +229,23 @@ export function App() {
   const handlers = useMemo(() => {
     const map: Record<string, (s: ReturnType<typeof useStore.getState>) => void> = {
       newTab: (s) => s.addHTab(),
-      closePane: (s) => s.closeFocusedPane(),
+      closePane: (s) => {
+        // A confirm is already waiting for its verdict — firing another close
+        // behind it would stack a second dialog on top of the first.
+        if (isCloseConfirmOpen()) return;
+        const h = activeHtab(s);
+        if (!h) return;
+        const blockers = closeBlockers(
+          agentActivitySummaryForSessions(ownedSessionIds([h.focused])),
+        );
+        if (blockers) {
+          setPendingPaneClose({
+            id: h.focused,
+            title: findLeaf(h.layout, h.focused)?.title ?? "",
+            ...blockers,
+          });
+        } else s.closeFocusedPane();
+      },
       splitRight: (s) => s.splitFocused("row"),
       splitDown: (s) => s.splitFocused("col"),
       toggleMaximize: (s) => {
@@ -193,6 +289,7 @@ export function App() {
         if (current) s.addChildNode(current.id);
       },
       newWorkspace: (s) => s.addWorkspace(),
+      newWindow: () => void openNewWindow(),
       previousTheme: (s) => s.prevTheme(),
       nextTheme: (s) => s.nextTheme(),
       toggleSidebar: (s) => s.toggleSidebar(),
@@ -206,10 +303,14 @@ export function App() {
         lastSettingsSection.current = "appearance";
         setSettingsSection((cur) => (cur === "appearance" ? null : "appearance"));
       },
-      openAgentHistory: () => setClaudeHistoryOpen((o) => !o),
-      openAgentUsage: () => setAgentUsageOpen((o) => !o),
+      openAgentHistory: (s) => s.addPane("history"),
+      openAgentUsage: (s) => s.addPane("usage"),
       openSystemMonitor: (s) => s.addPane("monitor"),
-      search: () => setSearchOpen((o) => !o),
+      // Keep the shortcut registered so we still consume the browser's native
+      // Cmd+P action, but only show this Pages-specific palette on Pages.
+      search: () => {
+        if (appTabRef.current === "pages") setSearchOpen((o) => !o);
+      },
       find: () => setFindOpen(true),
       findNext: (s) => {
         const h = activeHtab(s);
@@ -302,6 +403,15 @@ export function App() {
     return () => document.removeEventListener("keydown", onKey, true);
   }, []);
 
+  // A shell the user ended on purpose takes its pane with it, exactly as if
+  // they had pressed the close-pane shortcut. Listening here rather than in
+  // TerminalPane so a pane sitting in a backgrounded tab — which has no mounted
+  // component — still closes.
+  useEffect(
+    () => subscribeShellNaturalExit((paneId) => useStore.getState().closePane(paneId)),
+    []
+  );
+
   // Desktop: check for a new release once, shortly after startup (stays quiet —
   // just lights up the update badges; the install lives in Settings → About).
   useEffect(() => {
@@ -347,53 +457,77 @@ export function App() {
   }, []);
 
   return (
-    <div className={`app${isTauri ? " tauri" : ""}`}>
+    <div className={`app${isTauri ? " tauri" : ""}${botEnabled ? "" : " bot-disabled"}`}>
       {isTauri && <WindowControls />}
       {isTauri && <ResizeHandles />}
-      {!collapsed && <TreeSidebar onOpenSettings={openSettings} />}
-      <div className="main">
-        <HTabBar />
-        <div className="pane-area">
-          <div className="pane-card">
-            {htab && <SplitView key={htab.id} htab={htab} />}
-            {findOpen && focusedPane && (
-              <FindBar
-                key={focusedPane}
-                sessionId={focusedPane}
-                onClose={() => setFindOpen(false)}
-              />
-            )}
+      {botEnabled && <AppTabRail active={appTab} workspaceId={activeWorkspaceId} onChange={handleAppTabChange} />}
+      <WorkspaceSwitcher onOpenSettings={openSettings} />
+      {appTab === "pages" && (
+        <>
+          {!collapsed && <TreeSidebar />}
+          <div className="main">
+            <HTabBar />
+            <div className="pane-area">
+              <div className="pane-card">
+                {htab && <SplitView key={htab.id} htab={htab} />}
+                {findOpen && focusedPane && (
+                  <FindBar
+                    key={focusedPane}
+                    sessionId={focusedPane}
+                    onClose={() => setFindOpen(false)}
+                  />
+                )}
+              </div>
+            </div>
           </div>
-        </div>
-      </div>
-      {!railCollapsed && (
-        <SideRail
-          agentsOpen={agentsOpen}
-          onAgentsOpenChange={setAgentsOpen}
-          onOpenSettings={openSettings}
-          onOpenAgentsSettings={() => {
-            lastSettingsSection.current = "agents";
-            setSettingsSection("agents");
-          }}
-          onOpenClaudeHistory={() => setClaudeHistoryOpen(true)}
-          onOpenAgentUsage={() => setAgentUsageOpen(true)}
-        />
+          {!railCollapsed && (
+            <SideRail
+              agentsOpen={agentsOpen}
+              onAgentsOpenChange={setAgentsOpen}
+              onOpenSettings={openSettings}
+              onOpenAgentsSettings={() => {
+                lastSettingsSection.current = "agents";
+                setSettingsAgentId(null);
+                setSettingsSection("agents");
+              }}
+            />
+          )}
+        </>
       )}
+      {botEnabled && <div className="agent-workspace-host" hidden={appTab !== "agents"}>
+        <AgentWorkspace key={activeWorkspaceId} workspaceId={activeWorkspaceId} visible={appTab === "agents"} />
+      </div>}
       {settingsOpen && (
         <Settings
           initialSection={settingsSection ?? "appearance"}
-          onClose={() => setSettingsSection(null)}
+          initialAgentId={settingsAgentId ?? undefined}
+          onClose={() => {
+            setSettingsSection(null);
+            setSettingsAgentId(null);
+          }}
           onSectionChange={(next) => {
             lastSettingsSection.current = next;
           }}
+          onInstallAgent={installAgent}
         />
       )}
-      {searchOpen && (
+      {appTab === "pages" && searchOpen && (
         <SearchPalette onClose={() => setSearchOpen(false)} onRunAction={runAction} />
       )}
-      {claudeHistoryOpen && <AgentHistory onClose={() => setClaudeHistoryOpen(false)} />}
-      {agentUsageOpen && <AgentUsage onClose={() => setAgentUsageOpen(false)} />}
       {gitDiffOpen && <GitDiff session={gitSession} onClose={() => setGitDiffOpen(false)} />}
+      {pendingPaneClose && (
+        <CloseConfirm
+          kind="pane"
+          name={pendingPaneClose.title}
+          working={pendingPaneClose.working}
+          error={pendingPaneClose.error}
+          onConfirm={() => {
+            useStore.getState().closePane(pendingPaneClose.id);
+            setPendingPaneClose(null);
+          }}
+          onClose={() => setPendingPaneClose(null)}
+        />
+      )}
       {isTauri && <QuitConfirm />}
     </div>
   );

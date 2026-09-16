@@ -1,0 +1,15 @@
+
+╭─────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.146.0-alpha.9.2)            │
+│                                                 │
+│ model:     loading   /model to change           │
+│ directory: /home/user/project │
+╰─────────────────────────────────────────────────╯
+
+• Queued follow-up inputs
+  ↳ hi
+    ⌥ + ↑ edit last queued message
+
+› Implement {feature}
+
+  gpt-5.6-sol default · /home/user/project…

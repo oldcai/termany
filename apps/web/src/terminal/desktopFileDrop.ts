@@ -9,6 +9,34 @@ type Listener = (event: DesktopFileDropEvent) => void;
 const listeners = new Set<Listener>();
 let unlistenPromise: Promise<() => void> | null = null;
 
+function fileUrlToPath(url: string): string | null {
+  if (!url.startsWith("file://")) return null;
+  try {
+    let path = decodeURIComponent(new URL(url).pathname);
+    if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
+    return path;
+  } catch {
+    return null;
+  }
+}
+
+/** Best-effort browser/WebView fallback. Tauri's native event below is the
+ * reliable path source, because ordinary browsers intentionally hide it. */
+export function extractDroppedPaths(dataTransfer: DataTransfer): string[] {
+  const uriList = dataTransfer.getData("text/uri-list");
+  if (uriList) {
+    const paths = uriList
+      .split(/\r?\n/)
+      .filter((line) => line && !line.startsWith("#"))
+      .map(fileUrlToPath)
+      .filter((path): path is string => Boolean(path));
+    if (paths.length) return paths;
+  }
+  return Array.from(dataTransfer.files)
+    .map((file) => (file as File & { path?: string }).path)
+    .filter((path): path is string => Boolean(path));
+}
+
 async function listenToTauriDrops(): Promise<() => void> {
   const [{ getCurrentWebview }, { getCurrentWindow }] = await Promise.all([
     import("@tauri-apps/api/webview"),

@@ -34,10 +34,10 @@ const RULES: CredentialRule[] = [
  */
 export function subscriptionEnvironment(
   env: NodeJS.ProcessEnv,
-  agent: { id: string; runtime?: { command: string; args: string } | null }
+  agent: { id: string; runtime?: unknown }
 ): NodeJS.ProcessEnv {
   const next = { ...env };
-  const subject = `${agent.id} ${agent.runtime?.command ?? ""} ${agent.runtime?.args ?? ""}`;
+  const subject = runtimeSubject(agent);
   for (const rule of RULES) {
     if (!rule.match.test(subject)) continue;
     for (const name of rule.vars) delete next[name];
@@ -48,8 +48,17 @@ export function subscriptionEnvironment(
 /** Which variables would be dropped for `agent` — for logging and tests. */
 export function overriddenCredentials(agent: {
   id: string;
-  runtime?: { command: string; args: string } | null;
+  runtime?: unknown;
 }): string[] {
-  const subject = `${agent.id} ${agent.runtime?.command ?? ""} ${agent.runtime?.args ?? ""}`;
+  const subject = runtimeSubject(agent);
   return RULES.filter((rule) => rule.match.test(subject)).flatMap((rule) => rule.vars);
+}
+
+function runtimeSubject(agent: { id: string; runtime?: unknown }): string {
+  const runtime = agent.runtime && typeof agent.runtime === "object"
+    ? agent.runtime as { command?: unknown; args?: unknown }
+    : {};
+  return `${agent.id} ${typeof runtime.command === "string" ? runtime.command : ""} ${
+    typeof runtime.args === "string" ? runtime.args : ""
+  }`;
 }

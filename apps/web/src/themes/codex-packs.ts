@@ -9,28 +9,15 @@
  */
 import { apiPath } from "../api";
 import { fromCodexTheme } from "./codex-import";
+import { fetchCodexListings, type CodexListing } from "./codex-listings";
 import { registerTheme } from "./index";
 import type { Theme } from "./types";
 
-/** One installed package, as listed by GET /api/codex-themes. */
-export interface CodexListing {
-  manifest: { id: string; displayName?: string; description?: string; mode?: string };
-  artPath: string | null;
-  previewPath: string | null;
-}
+export { fetchCodexListings, type CodexListing } from "./codex-listings";
 
 /** Theme id a package maps to — stable, so a re-read updates in place. */
 export const codexThemeId = (packId: string) => `custom-codex-${packId}`;
 export const isCodexPackTheme = (themeId: string) => themeId.startsWith("custom-codex-");
-
-export async function fetchCodexListings(): Promise<{ themes: CodexListing[]; root: string | null }> {
-  const res = await fetch(apiPath("/api/codex-themes"));
-  const data = await res.json();
-  return {
-    themes: Array.isArray(data?.themes) ? data.themes : [],
-    root: typeof data?.root === "string" ? data.root : null,
-  };
-}
 
 /** Read a package's artwork as a data URL so it can ride along in the Theme. */
 async function readArt(artPath: string): Promise<{ mimeType: string; base64: string } | undefined> {

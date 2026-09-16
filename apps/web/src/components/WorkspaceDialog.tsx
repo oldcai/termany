@@ -1,5 +1,8 @@
+import { textInputProps } from "../textInputProps";
 import { useState } from "react";
 import { useI18n } from "../i18n";
+import { useImeGuard } from "../imeGuard";
+import { useNativeOccluder } from "../nativeViewOcclusion";
 import { EmojiPicker } from "./EmojiPicker";
 
 const initial = (t: string) => t.trim().charAt(0).toUpperCase() || "?";
@@ -25,13 +28,15 @@ export function WorkspaceDialog({
   const [title, setTitle] = useState(initTitle);
   const [icon, setIcon] = useState<string | undefined>(initIcon);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const ime = useImeGuard();
+  const backdropRef = useNativeOccluder<HTMLDivElement>("workspace-dialog");
 
   const submit = () => {
     if (title.trim()) onConfirm({ title: title.trim(), icon });
   };
 
   return (
-    <div className="ws-dialog-backdrop" onClick={onClose}>
+    <div className="ws-dialog-backdrop" ref={backdropRef} onClick={onClose}>
       <div className="ws-dialog" onClick={(e) => e.stopPropagation()}>
         <div className="ws-dialog-row">
           <button className="ws-dialog-icon" title={t("workspace.chooseIcon")} onClick={() => setPickerOpen((o) => !o)}>
@@ -42,13 +47,15 @@ export function WorkspaceDialog({
             )}
           </button>
           <input
+            {...textInputProps}
+            {...ime.props}
             className="ws-dialog-input"
             autoFocus
             value={title}
             placeholder={t("workspace.namePlaceholder")}
             onChange={(e) => setTitle(e.target.value)}
             onKeyDown={(e) => {
-              if (e.nativeEvent.isComposing) return; // let the IME handle Enter/Esc
+              if (ime.handled(e)) return; // the IME is still using this key
               if (e.key === "Enter") submit();
               else if (e.key === "Escape") onClose();
             }}

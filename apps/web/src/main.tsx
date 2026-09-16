@@ -5,6 +5,7 @@ import { isDemo } from "./demo";
 import { isTauri } from "./env";
 import { loadState, startStateSync, waitForServer } from "./state/sync";
 import { useStore } from "./state/store";
+import { revealWindow } from "./state/windows";
 import "./styles.css";
 import { loadSnapshots, startScrollSync } from "./terminal/scroll";
 import { applyTheme, loadAiThemes, loadThemeId, storedThemeId, THEMES } from "./themes";
@@ -70,5 +71,8 @@ waitForServer().then(() =>
         <App />
       </React.StrictMode>
     );
+    // Extra windows are created hidden so they never appear as an empty
+    // transparent rectangle in front of everything — see revealWindow.
+    revealWindow();
   })
 );

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Stdio};
@@ -12,7 +13,9 @@ mod macos_services {
 
     use objc2::rc::Retained;
     use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-    use objc2_app_kit::{NSApp, NSPasteboard, NSPasteboardItem, NSPasteboardTypeFileURL};
+    use objc2_app_kit::{
+        NSApp, NSPasteboard, NSPasteboardItem, NSPasteboardTypeFileURL, NSPasteboardTypeString,
+    };
     use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
     use tauri::{AppHandle, Url};
 
@@ -71,6 +74,17 @@ mod macos_services {
                 if let Ok(url) = Url::parse(&file_url.to_string()) {
                     if let Ok(path) = url.to_file_path() {
                         paths.push(path.to_string_lossy().into_owned());
+                        continue;
+                    }
+                }
+            }
+            // Finder matches this service through the plain-text (FilePath)
+            // flavour, so the item can carry bare paths instead of file URLs.
+            if let Some(text) = item.stringForType(unsafe { NSPasteboardTypeString }) {
+                for line in text.to_string().lines() {
+                    let line = line.trim();
+                    if line.starts_with('/') {
+                        paths.push(line.to_string());
                     }
                 }
             }
@@ -174,6 +188,26 @@ fn parse_version_field(body: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
+/// Count task records that are still actively working. The server owns this
+/// ledger across every window, so it is the authoritative update/restart guard.
+fn parse_running_task_count(body: &str) -> Option<usize> {
+    let payload: serde_json::Value = serde_json::from_str(body).ok()?;
+    let activities = payload.get("activities")?.as_object()?;
+    Some(
+        activities
+            .values()
+            .filter(|activity| activity.get("status").and_then(|v| v.as_str()) == Some("working"))
+            .count(),
+    )
+}
+
+fn running_server_task_count() -> usize {
+    server_get("/api/activity")
+        .as_deref()
+        .and_then(parse_running_task_count)
+        .unwrap_or(0)
+}
+
 /// Is a server already listening on our port, and is it OURS?
 ///
 /// In a packaged build there is no `pnpm dev:web` to start the backend, so the
@@ -186,10 +220,12 @@ fn parse_version_field(body: &str) -> Option<String> {
 /// we reuse it, this build's UI ends up talking to an older backend and every
 /// route added since that release 404s — the user sees a dashboard stuck on
 /// "Could not load …" with nothing obviously wrong. So a version mismatch
-/// counts as unhealthy: the caller then kills it and spawns the matching one.
+/// normally counts as unhealthy: the caller kills it and spawns the matching
+/// one. The exception is a server that still owns a working task; preserving
+/// that process takes priority, and the next safe relaunch completes the swap.
 ///
-/// Mismatch in either direction restarts, including the rarer
-/// downgrade/run-an-older-build case — matching this app beats guessing.
+/// This applies in either direction, including the rarer downgrade/run-an-
+/// older-build case — matching this app beats guessing once it is safe.
 fn existing_server_matches(expected: &str) -> bool {
     let Some(body) = server_get("/api/version") else {
         return false;
@@ -197,6 +233,13 @@ fn existing_server_matches(expected: &str) -> bool {
     match parse_version_field(&body) {
         Some(found) if found == expected => true,
         Some(found) => {
+            let running = running_server_task_count();
+            if running > 0 {
+                log::warn!(
+                    "[termany] server on localhost:{SERVER_PORT} is version {found}, this app is {expected}, but it owns {running} running task(s) — deferring the server upgrade"
+                );
+                return true;
+            }
             log::warn!(
                 "[termany] server on localhost:{SERVER_PORT} is version {found}, this app is {expected} — restarting it"
             );
@@ -524,10 +567,18 @@ fn kill_server(app: &tauri::AppHandle) {
 /// reopening the app — but a self-update swaps the server binary underneath
 /// it, so the frontend calls this right before `relaunch()` to make sure the
 /// next launch starts a server that matches the new build instead of talking
-/// to a stale one. No-op in dev (no bundled server, no managed state).
+/// to a stale one. Return a non-zero count instead of stopping when another
+/// window started a task after the frontend's first safety check. No-op in dev
+/// (no bundled server, no managed state).
 #[tauri::command]
-fn stop_server(app: tauri::AppHandle) {
+fn stop_server(app: tauri::AppHandle) -> usize {
+    let running = running_server_task_count();
+    if running > 0 {
+        log::info!("[termany] deferring update restart for {running} running task(s)");
+        return running;
+    }
     kill_server(&app);
+    0
 }
 
 #[tauri::command]
@@ -546,38 +597,263 @@ fn webview_history(app: tauri::AppHandle, label: String, direction: String) -> R
     webview.eval(script).map_err(|e| e.to_string())
 }
 
-fn focus_main_window(app_handle: &tauri::AppHandle) {
-    if let Some(window) = app_handle.get_webview_window("main") {
+/// The window the app was launched with. Extra windows get `main-2`, `main-3`,
+/// … — see `create_window`. Both patterns are listed in the capability file, so
+/// keep the prefix in sync with `capabilities/default.json` if it ever changes.
+const MAIN_WINDOW_LABEL: &str = "main";
+
+/// Suffix for the next extra window's label. Monotonic within a run so a label
+/// is never reused while its old window is still tearing down; it restarts at 2
+/// on the next launch, which is deliberate — the webview keys its per-window
+/// view (workspace + page) by label, so a reopened `main-2` lands where it was.
+struct WindowCounter(AtomicU32);
+
+/// Which window is currently showing which page (`window label` → `page id`).
+///
+/// Windows share everything else — workspaces, pages, tabs and panes are one
+/// record, and several windows in the same workspace is the point of having
+/// them. Pages are the exception: a page owns live terminals, the PTY server
+/// keeps exactly one socket per pane (it closes the previous on reattach), and
+/// a browser pane is a native child webview that belongs to one window by
+/// construction. So asking for a page another window holds raises that window
+/// instead of opening it twice — see `claim_page`.
+#[derive(Default)]
+struct PageClaims(Mutex<HashMap<String, String>>);
+
+/// The window an app-level action should land on: whichever one has focus,
+/// falling back to the original window and then to any window at all. Every
+/// place that used to hardcode `"main"` resolves through this — with several
+/// windows open, "the app" means the one the user is looking at.
+fn target_window(app_handle: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
+    let windows = app_handle.webview_windows();
+    windows
+        .values()
+        .find(|window| window.is_focused().unwrap_or(false))
+        .or_else(|| windows.get(MAIN_WINDOW_LABEL))
+        .or_else(|| windows.values().next())
+        .cloned()
+}
+
+/// Emit to the focused window only. Events that drive a dialog (`quit-requested`)
+/// or a one-shot action (`open-paths`) must not fan out to every window, or each
+/// one would put up its own copy.
+fn emit_to_target<P: serde::Serialize + Clone>(
+    app_handle: &tauri::AppHandle,
+    event: &str,
+    payload: P,
+) {
+    if let Some(window) = target_window(app_handle) {
+        let _ = app_handle.emit_to(window.label(), event, payload);
+    }
+}
+
+/// Open another app window, cascaded off the focused one so it doesn't land
+/// exactly on top. Chrome has to be set here rather than inherited: the window
+/// in `tauri.conf.json` is a one-off declaration, not a template.
+fn create_window(app_handle: &tauri::AppHandle) -> Result<String, String> {
+    let label = {
+        let counter = app_handle.state::<WindowCounter>();
+        loop {
+            let n = counter.0.fetch_add(1, Ordering::SeqCst);
+            let candidate = format!("{MAIN_WINDOW_LABEL}-{n}");
+            if app_handle.get_webview_window(&candidate).is_none() {
+                break candidate;
+            }
+        }
+    };
+
+    // Title, size and position come off the window in front where possible, so
+    // the new one matches it — including the dev build, which calls itself
+    // "Termany Dev" (tauri.dev.conf.json).
+    let source = target_window(app_handle);
+    let title = source
+        .as_ref()
+        .and_then(|window| window.title().ok())
+        .unwrap_or_else(|| "Termany".to_string());
+
+    let mut builder =
+        tauri::WebviewWindowBuilder::new(app_handle, &label, tauri::WebviewUrl::default())
+            .title(title)
+            .inner_size(1280.0, 832.0)
+            .min_inner_size(720.0, 480.0)
+            .resizable(true)
+            // Matches tauri.conf.json: the frontend draws its own titlebar,
+            // traffic lights and rounded corners (see WindowControls.tsx).
+            .decorations(false)
+            .transparent(true)
+            .shadow(true)
+            // Start hidden. The window is transparent and undecorated, so until
+            // the webview has painted there is literally nothing on screen —
+            // showing it right away turns the startup wait into "New Window did
+            // nothing", and the empty window steals the front spot meanwhile.
+            // The frontend reveals it on its first frame (see revealWindow).
+            .visible(false)
+            .focused(true);
+    // `dragDropEnabled: true` in tauri.conf.json is the builder's default —
+    // it only exposes the opt-out (`disable_drag_drop_handler`), so leaving it
+    // alone is what matches the declared window.
+
+    if let Some(source) = source {
+        if let Ok(scale) = source.scale_factor() {
+            if let Ok(size) = source.inner_size() {
+                let size = size.to_logical::<f64>(scale);
+                builder = builder.inner_size(size.width, size.height);
+            }
+            if let Ok(position) = source.outer_position() {
+                let position = position.to_logical::<f64>(scale);
+                const CASCADE: f64 = 28.0;
+                builder = builder.position(position.x + CASCADE, position.y + CASCADE);
+            }
+        }
+    }
+
+    let window = builder.build().map_err(|error| error.to_string())?;
+
+    // Safety net for the hidden start above: if the frontend never gets as far
+    // as revealing itself (a script error, or the server staying unreachable
+    // for the whole startup timeout), show the window anyway rather than leave
+    // an invisible one the user can neither see nor close.
+    let fallback = window.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(15));
+        if !fallback.is_visible().unwrap_or(true) {
+            log::warn!("[termany] new window never reported ready — showing it anyway");
+            let _ = fallback.show();
+            let _ = fallback.set_focus();
+        }
+    });
+
+    Ok(label)
+}
+
+#[tauri::command]
+fn open_new_window(app: tauri::AppHandle) -> Result<String, String> {
+    create_window(&app)
+}
+
+/// The pages spoken for by windows OTHER than `label`. Each window gets
+/// its own answer — asking the webview which window it is would just be a
+/// second, less reliable source of truth for something known for certain here.
+fn claims_excluding(app_handle: &tauri::AppHandle, label: &str) -> Vec<String> {
+    app_handle
+        .state::<PageClaims>()
+        .0
+        .lock()
+        .map(|claims| {
+            claims
+                .iter()
+                .filter(|(other, _)| other.as_str() != label)
+                .map(|(_, page)| page.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn broadcast_page_claims(app_handle: &tauri::AppHandle) {
+    for label in app_handle.webview_windows().keys() {
+        let claims = claims_excluding(app_handle, label);
+        let _ = app_handle.emit_to(label.as_str(), "page-claims", claims);
+    }
+}
+
+/// Pages another window is already showing, so this one can tell which are off
+/// limits without a round trip per page.
+#[tauri::command]
+fn page_claims(app: tauri::AppHandle, window: tauri::Window) -> Vec<String> {
+    claims_excluding(&app, window.label())
+}
+
+/// Record that `window` is showing `page_id`. Returns false when another
+/// window already holds it — that window is raised instead, and the caller is
+/// expected to stay where it is.
+#[tauri::command]
+fn claim_page(app: tauri::AppHandle, window: tauri::Window, page_id: String) -> bool {
+    let label = window.label().to_string();
+    let owner = {
+        let state = app.state::<PageClaims>();
+        let Ok(mut claims) = state.0.lock() else {
+            return true; // a poisoned lock must not lock the user out of switching
+        };
+        let owner = claims
+            .iter()
+            .find(|(other, held)| *other != &label && *held == &page_id)
+            .map(|(other, _)| other.clone());
+        if owner.is_none() {
+            claims.insert(label, page_id);
+        }
+        owner
+    };
+
+    match owner {
+        // Raising happens outside the lock — set_focus can pump the event loop.
+        Some(owner) => {
+            if let Some(window) = app.get_webview_window(&owner) {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            false
+        }
+        None => {
+            broadcast_page_claims(&app);
+            true
+        }
+    }
+}
+
+fn release_page_claim(app_handle: &tauri::AppHandle, label: &str) {
+    let removed = app_handle
+        .state::<PageClaims>()
+        .0
+        .lock()
+        .map(|mut claims| claims.remove(label).is_some())
+        .unwrap_or(false);
+    if removed {
+        broadcast_page_claims(app_handle);
+    }
+}
+
+fn focus_app_window(app_handle: &tauri::AppHandle) {
+    if let Some(window) = target_window(app_handle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
     }
 }
 
-/// Quake-style summon: hide when the window has focus, otherwise bring it up.
+/// Quake-style summon: hide when the app has focus, otherwise bring it up.
 /// The focus check (not just visibility) matters — when the window is merely
-/// behind another app, the hotkey should raise it, not hide it.
-fn toggle_main_window(app_handle: &tauri::AppHandle) {
-    let Some(window) = app_handle.get_webview_window("main") else {
+/// behind another app, the hotkey should raise it, not hide it. With several
+/// windows open the hotkey acts on all of them, so the app comes back exactly
+/// as the user left it rather than one window at a time.
+fn toggle_app_windows(app_handle: &tauri::AppHandle) {
+    let windows = app_handle.webview_windows();
+    if windows.is_empty() {
         return;
-    };
-    let focused = window.is_focused().unwrap_or(false);
-    let visible = window.is_visible().unwrap_or(false);
-    let minimized = window.is_minimized().unwrap_or(false);
-    if visible && focused && !minimized {
-        // Hide the whole app on macOS, not just the window: focus then falls
+    }
+    let showing = windows.values().any(|window| {
+        window.is_focused().unwrap_or(false)
+            && window.is_visible().unwrap_or(false)
+            && !window.is_minimized().unwrap_or(false)
+    });
+    if showing {
+        // Hide the whole app on macOS, not just the windows: focus then falls
         // back to the previously active app, so the user can keep typing where
         // they were — the iTerm2 hotkey-window behaviour.
         #[cfg(target_os = "macos")]
         let _ = app_handle.hide();
         #[cfg(not(target_os = "macos"))]
-        let _ = window.hide();
+        for window in windows.values() {
+            let _ = window.hide();
+        }
     } else {
         #[cfg(target_os = "macos")]
         let _ = app_handle.show();
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
+        for window in windows.values() {
+            let _ = window.unminimize();
+            let _ = window.show();
+        }
+        focus_app_window(app_handle);
     }
 }
 
@@ -644,7 +920,7 @@ fn apply_toggle_shortcut(app: &tauri::AppHandle, shortcut: Option<String>) -> Re
             // The plugin reports press and release separately; only act on
             // press, or every tap would toggle twice.
             if event.state == ShortcutState::Pressed {
-                toggle_main_window(app_handle);
+                toggle_app_windows(app_handle);
             }
         })
         .map_err(|e| e.to_string())?;
@@ -702,10 +978,10 @@ fn install_windows_tray(app: &tauri::App) -> tauri::Result<()> {
         // conventional right click.
         .show_menu_on_left_click(false)
         .on_menu_event(|app_handle, event| match event.id().as_ref() {
-            "tray_open" => focus_main_window(app_handle),
+            "tray_open" => focus_app_window(app_handle),
             "tray_quit" => {
-                focus_main_window(app_handle);
-                let _ = app_handle.emit_to("main", "quit-requested", ());
+                focus_app_window(app_handle);
+                emit_to_target(app_handle, "quit-requested", ());
             }
             _ => {}
         })
@@ -716,7 +992,7 @@ fn install_windows_tray(app: &tauri::App) -> tauri::Result<()> {
                 ..
             } = event
             {
-                focus_main_window(tray.app_handle());
+                focus_app_window(tray.app_handle());
             }
         });
     if let Some(icon) = app.default_window_icon() {
@@ -768,7 +1044,7 @@ fn refresh_windows_shortcut_icon_once(app: &tauri::App) {
 }
 
 fn emit_open_paths(app_handle: &tauri::AppHandle, paths: Vec<String>) {
-    focus_main_window(app_handle);
+    focus_app_window(app_handle);
     if paths.is_empty() {
         return;
     }
@@ -784,7 +1060,7 @@ fn emit_open_paths(app_handle: &tauri::AppHandle, paths: Vec<String>) {
     }
 
     if frontend_ready {
-        let _ = app_handle.emit_to("main", "open-paths", paths);
+        emit_to_target(app_handle, "open-paths", paths);
     }
 }
 
@@ -825,25 +1101,40 @@ pub fn run() {
             webview_history,
             confirm_quit,
             get_window_toggle_shortcut,
-            set_window_toggle_shortcut
+            set_window_toggle_shortcut,
+            open_new_window,
+            claim_page,
+            page_claims
         ])
-        // Intercept the main window's close request before the webview is
+        // Intercept the last window's close request before the webview is
         // destroyed. Waiting until RunEvent::ExitRequested is too late on
         // Windows: the event loop can be kept alive after the only window
         // (and the listener that shows the confirmation dialog) is gone.
-        .on_window_event(|window, event| {
-            if window.label() != "main" {
-                return;
-            }
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let Some(quitting) = window.app_handle().try_state::<QuitState>() else {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                let app_handle = window.app_handle();
+                // Extra windows are ordinary: closing one leaves the app (and
+                // every shell in the other windows) running, so it needs no
+                // confirmation. Only closing the last one means "quit", which
+                // is the decision the dialog guards against doing by accident.
+                if app_handle.webview_windows().len() > 1 {
+                    return;
+                }
+                let Some(quitting) = app_handle.try_state::<QuitState>() else {
                     return;
                 };
                 if !quitting.0.load(Ordering::SeqCst) {
                     api.prevent_close();
-                    let _ = window.emit("quit-requested", ());
+                    let _ = app_handle.emit_to(window.label(), "quit-requested", ());
                 }
             }
+            // Frees the window's page for another window to open. Uses
+            // Destroyed rather than CloseRequested so a close the dialog vetoes
+            // doesn't hand the page away while it's still on screen.
+            tauri::WindowEvent::Destroyed => {
+                release_page_claim(window.app_handle(), window.label());
+            }
+            _ => {}
         });
     // Self-update: version check + install (desktop only; mobile stores handle it).
     #[cfg(desktop)]
@@ -860,6 +1151,8 @@ pub fn run() {
                 frontend_ready: false,
             })));
             app.manage(QuitState(AtomicBool::new(false)));
+            app.manage(WindowCounter(AtomicU32::new(2)));
+            app.manage(PageClaims::default());
             #[cfg(target_os = "macos")]
             macos_services::install(app.handle().clone());
             #[cfg(target_os = "windows")]
@@ -911,20 +1204,37 @@ pub fn run() {
                     .paste()
                     .select_all()
                     .build()?;
+                // No accelerator on either item, for the ⌘M reason above: the
+                // app binds New Window itself (Settings → Keyboard, ⌥⌘N by
+                // default) so it stays rebindable and shows up in the ⌘P
+                // palette. A menu keyEquivalent would swallow the keystroke
+                // before the webview saw it, leaving two bindings to disagree.
+                let new_window = MenuItemBuilder::new("New Window")
+                    .id("new_window")
+                    .build(app)?;
                 let minimize = MenuItemBuilder::new("Minimize").id("minimize").build(app)?;
-                let window_menu = SubmenuBuilder::new(app, "Window").item(&minimize).build()?;
+                let window_menu = SubmenuBuilder::new(app, "Window")
+                    .item(&new_window)
+                    .separator()
+                    .item(&minimize)
+                    .build()?;
                 let menu = MenuBuilder::new(app)
                     .items(&[&app_menu, &edit_menu, &window_menu])
                     .build()?;
                 app.set_menu(menu)?;
-                app.on_menu_event(|app_handle, event| {
-                    if event.id() == "quit" {
-                        let _ = app_handle.emit_to("main", "quit-requested", ());
-                    } else if event.id() == "minimize" {
-                        if let Some(window) = app_handle.get_webview_window("main") {
+                app.on_menu_event(|app_handle, event| match event.id().as_ref() {
+                    "quit" => emit_to_target(app_handle, "quit-requested", ()),
+                    "new_window" => {
+                        if let Err(error) = create_window(app_handle) {
+                            log::warn!("[termany] could not open a new window: {error}");
+                        }
+                    }
+                    "minimize" => {
+                        if let Some(window) = target_window(app_handle) {
                             let _ = window.minimize();
                         }
                     }
+                    _ => {}
                 });
             }
 
@@ -969,7 +1279,7 @@ pub fn run() {
                     let quitting = app_handle.state::<QuitState>();
                     if !quitting.0.load(Ordering::SeqCst) {
                         api.prevent_exit();
-                        let _ = app_handle.emit_to("main", "quit-requested", ());
+                        emit_to_target(app_handle, "quit-requested", ());
                     }
                 }
                 #[cfg(target_os = "macos")]
@@ -990,7 +1300,7 @@ pub fn run() {
 mod tests {
     use super::{
         is_termany_server_command, node_compatible_windows_path, parse_pid_lines,
-        parse_version_field,
+        parse_running_task_count, parse_version_field,
     };
     use std::path::{Path, PathBuf};
 
@@ -1013,6 +1323,18 @@ mod tests {
         assert_eq!(parse_version_field("{}"), None);
         assert_eq!(parse_version_field("not json at all"), None);
         assert_eq!(parse_version_field(r#"{"version":"#), None);
+    }
+
+    #[test]
+    fn counts_only_working_server_tasks() {
+        assert_eq!(
+            parse_running_task_count(
+                r#"{"activities":{"a":{"status":"working"},"b":{"status":"done"},"c":{"status":"error"},"d":{"status":"working"}}}"#
+            ),
+            Some(2)
+        );
+        assert_eq!(parse_running_task_count(r#"{"activities":{}}"#), Some(0));
+        assert_eq!(parse_running_task_count("not json"), None);
     }
 
     #[test]

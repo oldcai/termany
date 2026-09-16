@@ -88,6 +88,11 @@ export function setAgentsRaw(json: string): void {
 
 export interface AppState {
   workspaces: unknown[];
+  agentConversations: unknown[];
+  userProfile: {
+    nickname: string;
+    avatar?: string;
+  };
   activeWorkspace: string;
   sidebarCollapsed: boolean;
 }
@@ -96,6 +101,28 @@ export function loadState(): AppState {
   const rows = db.prepare("SELECT data FROM workspace ORDER BY pos").all() as { data: string }[];
   return {
     workspaces: rows.map((r) => JSON.parse(r.data)),
+    agentConversations: (() => {
+      try {
+        const parsed = JSON.parse(getMeta("agentConversations") ?? "[]");
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    })(),
+    userProfile: (() => {
+      try {
+        const parsed = JSON.parse(getMeta("userProfile") ?? "{}");
+        if (!parsed || typeof parsed !== "object" || typeof parsed.nickname !== "string") {
+          return { nickname: "" };
+        }
+        return {
+          nickname: parsed.nickname,
+          ...(typeof parsed.avatar === "string" && parsed.avatar ? { avatar: parsed.avatar } : {}),
+        };
+      } catch {
+        return { nickname: "" };
+      }
+    })(),
     activeWorkspace: getMeta("activeWorkspace") ?? "",
     sidebarCollapsed: getMeta("sidebarCollapsed") === "1",
   };
@@ -108,6 +135,16 @@ export function saveState(state: AppState): void {
     db.exec("DELETE FROM workspace");
     const ins = db.prepare("INSERT INTO workspace(id, pos, data) VALUES(?, ?, ?)");
     workspaces.forEach((w: any, i) => ins.run(String(w?.id ?? i), i, JSON.stringify(w)));
+    setMeta(
+      "agentConversations",
+      JSON.stringify(Array.isArray(state.agentConversations) ? state.agentConversations : [])
+    );
+    setMeta("userProfile", JSON.stringify({
+      nickname: typeof state.userProfile?.nickname === "string" ? state.userProfile.nickname : "",
+      ...(typeof state.userProfile?.avatar === "string" && state.userProfile.avatar
+        ? { avatar: state.userProfile.avatar }
+        : {}),
+    }));
     setMeta("activeWorkspace", String(state.activeWorkspace ?? ""));
     setMeta("sidebarCollapsed", state.sidebarCollapsed ? "1" : "0");
     db.exec("COMMIT");

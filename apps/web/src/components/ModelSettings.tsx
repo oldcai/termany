@@ -1,3 +1,4 @@
+import { textInputProps } from "../textInputProps";
 import { useEffect, useState } from "react";
 import { apiPath } from "../api";
 import { useI18n } from "../i18n";
@@ -273,6 +274,7 @@ export function ModelSettings() {
       );
       setDefaultModel(cfg.defaultModel);
       setStatus(t("models.saved"));
+      window.dispatchEvent(new Event("termany:models-changed"));
       return true;
     } catch (e) {
       setStatus(t("models.saveFailed", { error: e instanceof Error ? e.message : String(e) }));
@@ -422,6 +424,7 @@ export function ModelSettings() {
             <label className="ms-field">
               <span>{t("models.form.name")}</span>
               <input
+                {...textInputProps}
                 value={draft.name}
                 placeholder={t("models.form.namePlaceholder")}
                 onChange={(e) => setDraft({ ...draft, name: e.target.value })}
@@ -430,6 +433,7 @@ export function ModelSettings() {
             <label className="ms-field">
               <span>{t("models.form.apiBase")}</span>
               <input
+                {...textInputProps}
                 value={draft.apiBase}
                 placeholder={DEFAULT_BASE[draft.kind]}
                 onChange={(e) => {
@@ -441,6 +445,7 @@ export function ModelSettings() {
             <label className="ms-field">
               <span>{t("models.form.apiKey")}</span>
               <input
+                {...textInputProps}
                 type="password"
                 value={draft.apiKey}
                 placeholder={t(draft.hasStoredKey ? "models.form.keyKeep" : "models.form.keyPlaceholder")}
@@ -453,6 +458,7 @@ export function ModelSettings() {
             <label className="ms-field">
               <span>{t("models.form.models")}</span>
               <textarea
+                {...textInputProps}
                 rows={3}
                 value={draft.modelsText}
                 placeholder={draft.kind === "anthropic" ? "claude-opus-4-8" : "deepseek-chat"}

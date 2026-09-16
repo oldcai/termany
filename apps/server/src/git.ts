@@ -198,12 +198,19 @@ function defaultBase(wt: Omit<GitWorktree, "files">, refs: string[], mainBranch:
  */
 async function changedCount(root: string, base: string | undefined): Promise<number> {
   try {
-    const status = git(["status", "--porcelain=v1", "-z"], root);
-    const tracked = base
-      ? git(["diff", "--name-only", "-z", await mergeBase(root, base)], root)
-      : Promise.resolve("");
-    const files = new Set((await tracked).split("\0").filter(Boolean));
-    const records = (await status).split("\0");
+    // Promise.all observes BOTH promises even when one rejects — awaiting them
+    // sequentially let the first rejection skip the second await, stranding an
+    // unhandled rejection that takes the whole server down (spawn git ENOENT
+    // when the worktree directory was deleted behind our back, or git itself
+    // is missing from the server's PATH).
+    const [statusOut, trackedOut] = await Promise.all([
+      git(["status", "--porcelain=v1", "-z"], root),
+      base
+        ? mergeBase(root, base).then((mb) => git(["diff", "--name-only", "-z", mb], root))
+        : Promise.resolve(""),
+    ]);
+    const files = new Set(trackedOut.split("\0").filter(Boolean));
+    const records = statusOut.split("\0");
     for (let i = 0; i < records.length; i++) {
       const record = records[i];
       if (record.length < 4) continue;
@@ -365,6 +372,21 @@ async function resolveScope(cwd: string, worktree?: string) {
   return { root: selected?.path ?? cwdRoot, worktrees, selected };
 }
 
+/**
+ * Just enough repo shape for scoping UIs (the session-history browser): root,
+ * branch, and the worktree list. gitOverview computes diff rows plus a
+ * changed-files badge per worktree — seconds of git on a repo with many
+ * worktrees — which a scope picker doesn't need.
+ */
+export async function worktreeOverview(cwd: string): Promise<
+  { repo: false } | { repo: true; root: string; branch: string; worktrees: Omit<GitWorktree, "files">[] }
+> {
+  const root = await repoRoot(cwd);
+  if (!root) return { repo: false };
+  const [branch, worktrees] = await Promise.all([currentBranch(root), listWorktrees(root)]);
+  return { repo: true, root, branch, worktrees };
+}
+
 export async function gitOverview(cwd: string, scope: GitScope = {}): Promise<GitOverview> {
   const resolved = await resolveScope(cwd, scope.worktree);
   if (!resolved) return { repo: false };
@@ -448,11 +470,20 @@ function cap(diff: string): GitDiff {
  * and portable.
  */
 async function untrackedDiff(abs: string, relative: string): Promise<GitDiff> {
+  let handle: fs.promises.FileHandle | undefined;
   let buf: Buffer;
+  let fileTruncated = false;
   try {
-    buf = await fs.promises.readFile(abs);
+    handle = await fs.promises.open(abs, "r");
+    const stat = await handle.stat();
+    const head = Buffer.allocUnsafe(Math.min(stat.size, DIFF_CAP + 1));
+    const { bytesRead } = await handle.read(head, 0, head.length, 0);
+    buf = head.subarray(0, Math.min(bytesRead, DIFF_CAP));
+    fileTruncated = stat.size > DIFF_CAP;
   } catch {
     return { diff: "" };
+  } finally {
+    await handle?.close().catch(() => undefined);
   }
   // Same heuristic as /api/fs/read: a NUL byte in the head means "not text".
   if (buf.subarray(0, 8000).includes(0)) return { diff: "", binary: true };
@@ -463,7 +494,8 @@ async function untrackedDiff(abs: string, relative: string): Promise<GitDiff> {
   const body = lines.map((line) => `+${line}`).join("\n");
   const tail = endsWithNewline ? "\n" : "\n\\ No newline at end of file\n";
   const header = `--- /dev/null\n+++ b/${relative}\n@@ -0,0 +1,${lines.length} @@\n`;
-  return cap(header + body + tail);
+  const result = cap(header + body + tail);
+  return fileTruncated && !result.truncated ? { ...result, truncated: true } : result;
 }
 
 /** Files requested together, capped so one pathspec can't grow unbounded. */

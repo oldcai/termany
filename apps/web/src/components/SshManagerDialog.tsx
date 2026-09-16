@@ -1,3 +1,4 @@
+import { textInputProps } from "../textInputProps";
 import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { apiPath } from "../api";
@@ -180,9 +181,9 @@ export function SshManagerDialog({
         {!form && <div className="ssh-manager-toolbar"><button className="ssh-manager-add" onClick={() => setForm(blank())}><PlusIcon />{t("ssh.add")}</button></div>}
         {form ? (
           <div className="ssh-profile-form">
-            <label>{t("ssh.profileName")}<input autoFocus spellCheck={false} autoCorrect="off" autoCapitalize="none" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
-            <label>{t("ssh.profileHost")}<input spellCheck={false} autoCorrect="off" autoCapitalize="none" placeholder={t("ssh.hostPlaceholder")} value={`${form.user ? `${form.user}@` : ""}${form.host}`} onChange={(e) => setForm({ ...form, user: undefined, host: e.target.value })} /></label>
-            <label>{t("ssh.profilePort")}<input inputMode="numeric" spellCheck={false} autoCorrect="off" autoCapitalize="none" value={form.port ?? ""} onChange={(e) => setForm({ ...form, port: e.target.value ? Number(e.target.value) : undefined })} /></label>
+            <label>{t("ssh.profileName")}<input {...textInputProps} autoFocus value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
+            <label>{t("ssh.profileHost")}<input {...textInputProps} placeholder={t("ssh.hostPlaceholder")} value={`${form.user ? `${form.user}@` : ""}${form.host}`} onChange={(e) => setForm({ ...form, user: undefined, host: e.target.value })} /></label>
+            <label>{t("ssh.profilePort")}<input {...textInputProps} inputMode="numeric" value={form.port ?? ""} onChange={(e) => setForm({ ...form, port: e.target.value ? Number(e.target.value) : undefined })} /></label>
             <fieldset className="ssh-auth-field">
               <legend>{t("ssh.authentication")}</legend>
               <div className="ssh-auth-switch">
@@ -194,7 +195,7 @@ export function SshManagerDialog({
               </div>
               <p>{t(authMethod === "password" ? "ssh.passwordHint" : authMethod === "identity" ? "ssh.identityHint" : "ssh.defaultAuthHint")}</p>
             </fieldset>
-            {authMethod === "identity" && <label>{t("ssh.identityFile")}<input spellCheck={false} autoCorrect="off" autoCapitalize="none" placeholder="~/.ssh/id_ed25519" value={form.identityFile ?? ""} onChange={(e) => setForm({ ...form, identityFile: e.target.value })} /></label>}
+            {authMethod === "identity" && <label>{t("ssh.identityFile")}<input {...textInputProps} placeholder="~/.ssh/id_ed25519" value={form.identityFile ?? ""} onChange={(e) => setForm({ ...form, identityFile: e.target.value })} /></label>}
             {error && <div className="ssh-manager-error">{error}</div>}
             <div className="ssh-manager-actions">
               <div className={`ssh-test-status ${testStatus ?? ""}`}>{testStatus ? t(`ssh.test.${testStatus}`) : ""}</div>

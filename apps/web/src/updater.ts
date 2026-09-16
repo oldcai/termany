@@ -1,3 +1,4 @@
+import { apiPath } from "./api";
 import { isTauri } from "./env";
 
 /**
@@ -14,6 +15,31 @@ export interface UpdateInfo {
 
 /** The plugin's Update handle, kept between check and install. */
 let pending: import("@tauri-apps/plugin-updater").Update | null = null;
+let installed = false;
+
+interface ActivityPayload {
+  activities?: Record<string, { status?: unknown } | null>;
+}
+
+/** Count server-owned tasks so updates are safe across every app window. */
+export function countRunningTasks(payload: unknown): number {
+  if (!payload || typeof payload !== "object") return 0;
+  const activities = (payload as ActivityPayload).activities;
+  if (!activities || typeof activities !== "object") return 0;
+  return Object.values(activities).filter((activity) => activity?.status === "working").length;
+}
+
+export async function runningTaskCount(): Promise<number> {
+  if (!isTauri) return 0;
+  const response = await fetch(apiPath("/api/activity"), { cache: "no-store" });
+  if (!response.ok) throw new Error(`could not check running tasks (${response.status})`);
+  return countRunningTasks(await response.json());
+}
+
+/** The update can remain installed while its restart waits for live tasks. */
+export function isUpdateInstalled(): boolean {
+  return installed;
+}
 
 /** Ask the endpoint whether a newer build exists. null = already current. */
 export async function checkForUpdate(): Promise<UpdateInfo | null> {
@@ -27,6 +53,10 @@ export async function checkForUpdate(): Promise<UpdateInfo | null> {
 
 /** Download + install the pending update, reporting 0–100 progress. */
 export async function installUpdate(onProgress: (pct: number) => void): Promise<void> {
+  if (installed) {
+    onProgress(100);
+    return;
+  }
   if (!pending) throw new Error("no update pending — call checkForUpdate first");
   let total = 0;
   let received = 0;
@@ -41,16 +71,27 @@ export async function installUpdate(onProgress: (pct: number) => void): Promise<
       onProgress(100);
     }
   });
+  installed = true;
 }
 
-/** Restart into the freshly installed version. */
-export async function relaunchApp(): Promise<void> {
+/**
+ * Restart into the freshly installed version when no task is still running.
+ * Returns the number of tasks that deferred the restart. The Rust command
+ * repeats the check immediately before stopping the PTY server, closing the
+ * race with another window starting a task after the HTTP check above.
+ */
+export async function relaunchApp(): Promise<number> {
+  const running = await runningTaskCount();
+  if (running > 0) return running;
+
   // Terminal sessions otherwise survive an ordinary quit + relaunch (the
   // bundled server keeps running across it — see the desktop lib.rs). An
   // update swaps the server binary itself, so stop the old one explicitly
   // here; otherwise the new app build would reconnect to stale server code.
   const { invoke } = await import("@tauri-apps/api/core");
-  await invoke("stop_server").catch(() => {});
+  const guardedRunning = await invoke<number>("stop_server");
+  if (guardedRunning > 0) return guardedRunning;
   const { relaunch } = await import("@tauri-apps/plugin-process");
   await relaunch();
+  return 0;
 }

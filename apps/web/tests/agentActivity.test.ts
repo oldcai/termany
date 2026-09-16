@@ -28,7 +28,13 @@ test("page and tab indicators expose separate counts for all three states", () =
 
   assert.match(manager, /export function agentActivitySummary/);
   assert.match(manager, /export function acknowledgeAgentActivities/);
+  assert.match(manager, /export function hasActiveAgentSession/);
+  assert.match(
+    manager,
+    /acknowledgeAgentActivities[\s\S]*agentActiveSessions\.has\(id\)[\s\S]*return \[\]/,
+  );
   assert.match(sidebar, /\["working", "done", "error"\]/);
+  assert.match(sidebar, /hasActiveAgentSession\(leafIds\)/);
   assert.match(sidebar, /agentActivitySummary\(allLeafIds\)/);
   assert.match(sidebar, /acknowledgeAgentActivities\(viewedLeafIds\)/);
   assert.match(tabs, /\["working", "done", "error"\]/);

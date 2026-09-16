@@ -3,55 +3,21 @@ import {
   attachSession,
   detachSession,
   fitSession,
-  focusSession,
   noteManualScroll,
+  reconcileTerminalFocus,
   scrollSessionToBottom,
   scrollSessionToTop,
   subscribeTerminalScrollState,
   subscribeSshNaturalExit,
   terminalSessionId,
+  uploadFilesToSession,
   type TerminalScrollState,
 } from "../terminal/manager";
-import { subscribeDesktopFileDrops } from "../terminal/desktopFileDrop";
+import { extractDroppedPaths, subscribeDesktopFileDrops } from "../terminal/desktopFileDrop";
+import { reconcileAttachedTerminalFocus } from "../terminal/focusHandoff";
 import { activeHtab, cwdCandidates, useStore } from "../state/store";
 import { openLocalPathsInSession } from "../terminal/openLocalPath";
 import { ChevronIcon } from "./icons";
-
-function fileUrlToPath(url: string): string | null {
-  if (!url.startsWith("file://")) return null;
-  try {
-    let p = decodeURIComponent(new URL(url).pathname);
-    if (/^\/[A-Za-z]:\//.test(p)) p = p.slice(1); // file:///C:/... on Windows
-    return p;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Extract absolute local paths from a native OS file drop (Finder → this
- * pane). What's actually available depends on the webview: `text/uri-list`
- * `file://` entries (some WebKit versions populate this for local-file
- * drags) or a `File.path` (an Electron-only extension a Tauri build may or
- * may not shim) — neither is guaranteed with this app's `dragDropEnabled:
- * false` (see pasteIntoSession's doc comment in manager.ts for why that's
- * set). If nothing yields a real path, returns empty so the caller no-ops
- * instead of pasting garbage.
- */
-function extractDroppedPaths(dt: DataTransfer): string[] {
-  const uriList = dt.getData("text/uri-list");
-  if (uriList) {
-    const paths = uriList
-      .split(/\r?\n/)
-      .filter((line) => line && !line.startsWith("#"))
-      .map(fileUrlToPath)
-      .filter((p): p is string => !!p);
-    if (paths.length) return paths;
-  }
-  return Array.from(dt.files)
-    .map((f) => (f as File & { path?: string }).path)
-    .filter((p): p is string => !!p);
-}
 
 /**
  * Mounts the persistent session DOM node for `id` into this slot. On unmount we
@@ -78,7 +44,28 @@ export function TerminalPane({ id, sshTarget }: { id: string; sshTarget?: string
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
-    attachSession(sessionId, host, cwdCandidates(useStore.getState(), id), sshTarget, id);
+    const state = useStore.getState();
+    attachSession(
+      sessionId,
+      host,
+      cwdCandidates(state, id),
+      sshTarget,
+      id,
+    );
+
+    // Attaching is the terminal's readiness boundary. The parent SplitView
+    // normally reconciles after its children mount, but a newly-created pane
+    // must not depend on React's cross-component passive-effect ordering to
+    // receive the keyboard. Project the canonical store focus once now and
+    // once after layout/default browser focus has settled. Re-reading the
+    // store in both passes prevents a stale attach from stealing focus if the
+    // user switched panes in the meantime.
+    const cancelFocusHandoff = reconcileAttachedTerminalFocus(
+      id,
+      () => activeHtab(useStore.getState())?.focused,
+      reconcileTerminalFocus,
+    );
+
     const unsubscribeScrollState = subscribeTerminalScrollState(sessionId, setScrollState);
 
     // Coalesce resize bursts (window/split-drag fires RO every frame) to ONE fit
@@ -95,6 +82,7 @@ export function TerminalPane({ id, sshTarget }: { id: string; sshTarget?: string
     ro.observe(host);
 
     return () => {
+      cancelFocusHandoff();
       if (raf) cancelAnimationFrame(raf);
       ro.disconnect();
       unsubscribeScrollState();
@@ -147,20 +135,23 @@ export function TerminalPane({ id, sshTarget }: { id: string; sshTarget?: string
 
       if (event.type === "drop") {
         setDragOver(false);
-        void openLocalPathsInSession(id, event.paths);
+        if (sshTarget && event.paths.length) {
+          uploadFilesToSession(terminalSessionId(id, sshTarget), event.paths);
+        } else {
+          void openLocalPathsInSession(id, event.paths);
+        }
         return;
       }
 
       setDragOver(true);
     });
-  }, [id]);
+  }, [id, sshTarget]);
 
   return (
     <div className={`term-pane ${dragOver ? "drag-over" : ""}`}>
       <div
         className="term-pane-host"
         ref={hostRef}
-        onMouseDown={() => focusSession(sessionId)}
         onWheel={() => {
           noteManualScroll(sessionId);
           revealScrollJump();
@@ -176,7 +167,11 @@ export function TerminalPane({ id, sshTarget }: { id: string; sshTarget?: string
           e.preventDefault();
           setDragOver(false);
           const paths = extractDroppedPaths(e.dataTransfer);
-          void openLocalPathsInSession(id, paths);
+          if (sshTarget && paths.length) {
+            uploadFilesToSession(terminalSessionId(id, sshTarget), paths);
+          } else {
+            void openLocalPathsInSession(id, paths);
+          }
         }}
       />
       {scrollState.hasOverflow && (

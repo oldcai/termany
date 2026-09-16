@@ -12,7 +12,9 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { AgentActivityTracker } from "./agentActivity.js";
-import { listAgentSessions, listAgentUsage, warmAgentSessionCache } from "./agentSessions.js";
+import { detectAgentExecutable, detectCommandExecutable, parseAgentDetectionInput } from "./agentDetection.js";
+import { sampleOnceOutputSettles } from "./foregroundJob.js";
+import { DEFAULT_SESSION_PAGE_SIZE, listAgentSessions, listAgentUsage } from "./agentSessions.js";
 import { streamAgentChat } from "./agentChat.js";
 import { listAgentConfigs, saveAgentConfigs } from "./agentConfig.js";
 import {
@@ -29,8 +31,22 @@ import {
 import { sessionListeningPorts } from "./sessionPorts.js";
 import { KillError, killProcess, readSystemStats } from "./systemStats.js";
 import { listSshConnections, listSshProfiles, saveSshProfileFromTarget, saveSshProfiles, sshArgsForConnection, testSshProfile } from "./ssh.js";
+import { SshPortForwarding } from "./sshPortForwarding.js";
 import { WebSocketServer, type WebSocket } from "ws";
 import { listConfig, saveConfig } from "./config.js";
+import { gatewayState, saveGatewayRoute, connectGatewayRoute, disconnectGatewayRoute, gatewayConnection, proxyGatewayRequest } from "./modelGateway.js";
+import {
+  APP_IDS,
+  applyProvider,
+  backups,
+  importCcSwitch,
+  previewCcSwitchImport,
+  providerState,
+  removeProvider,
+  rollback,
+  upsertProvider,
+  type AppId,
+} from "./agentProviders/index.js";
 import {
   forgetSessions,
   getAllScreens,
@@ -43,12 +59,18 @@ import {
   setScrollBatch,
   setSessionCwd,
 } from "./db.js";
-import { gitDiffs, gitOverview } from "./git.js";
+import { gitDiffs, gitOverview, worktreeOverview } from "./git.js";
 import { pickFolder } from "./folderPicker.js";
+import { pickFiles } from "./filePicker.js";
 import { testProvider } from "./providerTest.js";
 import { ptyEnvironment } from "./ptyEnvironment.js";
-import { resolveExecutable } from "./shellPath.js";
 import { generateTheme } from "./theme.js";
+import {
+  createTransferPipeline,
+  stripTransferMagic,
+  TRANSFER_PROTOCOLS,
+  type TransferPipeline,
+} from "./fileTransfer.js";
 
 /** Read a JSON request body (capped) into an object. */
 function readJson(req: import("node:http").IncomingMessage, maxChars = 1_000_000): Promise<any> {
@@ -156,19 +178,6 @@ const IS_WIN = os.platform() === "win32";
 const PASTE_DIR = process.env.TERMANY_PASTE_DIR ?? `${os.tmpdir()}/termany-pastes`;
 const execFileAsync = promisify(execFile);
 
-function firstShellToken(input: string): string {
-  const trimmed = input.trim();
-  const match = /^"([^"]+)"|^'([^']+)'|^(\S+)/.exec(trimmed);
-  return match?.[1] ?? match?.[2] ?? match?.[3] ?? "";
-}
-
-async function detectExecutable(command: string): Promise<{ command: string; installed: boolean; path?: string }> {
-  const executable = firstShellToken(command);
-  if (!executable) return { command, installed: false };
-  const found = await resolveExecutable(executable);
-  return found ? { command, installed: true, path: found } : { command, installed: false };
-}
-
 function windowsPowerShellPath(): string {
   const root = process.env.SystemRoot || "C:\\Windows";
   return `${root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
@@ -234,7 +243,20 @@ function trackOscCwd(pid: number, data: string): void {
 
 type ClientMessage =
   | { type: "input"; data: string }
-  | { type: "resize"; cols: number; rows: number };
+  | { type: "resize"; cols: number; rows: number }
+  | { type: "upload-files"; paths: string[] };
+
+// Mirrors packages/core's ShellExit wire format — kept in sync by hand because
+// this server bundles standalone (see scripts/bundle-server.mjs) and does not
+// depend on the workspace package. The frontend needs to tell "the user typed
+// `exit`" apart from "the shell crashed" to decide whether to close the pane,
+// and the CLOSE frame is the only channel that can't be confused with terminal
+// output. 4000-4999 is WebSocket's private-use close-code range.
+const SHELL_EXIT_CLOSE_CODE = 4000;
+
+function encodeShellExit(exitCode: number, signal: number | undefined): string {
+  return JSON.stringify({ exitCode, signal: signal ?? 0 });
+}
 
 // --- scroll history ---------------------------------------------------------
 // Every live session tails its raw PTY output into a per-session ring
@@ -288,7 +310,9 @@ function ringAppend(ring: ScrollRing, data: string): void {
  */
 function sanitizeForReplay(data: string): string {
   return (
-    data
+    // File transfer handshakes — replaying one would announce a phantom
+    // transfer to the restored session's pipeline
+    stripTransferMagic(data)
       // DCS strings (XTGETTCAP etc.) — queries wrapped in ESC P ... ESC \
       .replace(/\x1bP[\s\S]*?(?:\x1b\\|\x07)/g, "")
       // OSC 52 — replaying it would overwrite the user's clipboard
@@ -371,6 +395,8 @@ interface PtySession {
   detachedAt: number | null;
   /** Null is the local login shell; otherwise the OpenSSH destination. */
   sshTarget: string | null;
+  /** In-band file transfer, wired in wireSession() as the pty is attached. */
+  transfer?: TransferPipeline;
 }
 
 const ptySessions = new Map<string, PtySession>();
@@ -382,12 +408,14 @@ const activityStreams = new Set<ServerResponse>();
 const activityInstance = `${process.pid}-${Date.now().toString(36)}`;
 let activityRevision = 0;
 const activityTracker = new AgentActivityTracker({ onChange: activityChanged });
+const sshPortForwarding = new SshPortForwarding();
 
 function activityPayload() {
   return {
     instance: activityInstance,
     revision: activityRevision,
     activities: activityTracker.snapshot(),
+    activeSessions: activityTracker.activeSessionIds(),
   };
 }
 
@@ -407,12 +435,41 @@ function activityChanged(): void {
   }
 }
 
-setInterval(() => {
-  for (const stream of activityStreams) {
+/**
+ * Clients watching the workspace layout. Every app window renders the same
+ * shared record, so a change made in one has to reach the others — without this
+ * a second window would keep PUTting the copy it hydrated with at startup and
+ * quietly undo the first window's edits (saveState is a whole-table rewrite).
+ *
+ * Like the activity stream above, events carry a complete snapshot, so a
+ * reconnect is self-healing. Each is tagged with the writer's client id, which
+ * that client uses to ignore the echo of its own save.
+ */
+const stateStreams = new Set<ServerResponse>();
+
+function stateEvent(clientId: string): string {
+  return `event: state\ndata: ${JSON.stringify({ clientId, ...loadState() })}\n\n`;
+}
+
+function stateChanged(clientId: string): void {
+  const event = stateEvent(clientId);
+  for (const stream of stateStreams) {
     try {
-      stream.write(": keepalive\n\n");
+      stream.write(event);
     } catch {
-      activityStreams.delete(stream);
+      stateStreams.delete(stream);
+    }
+  }
+}
+
+setInterval(() => {
+  for (const streams of [activityStreams, stateStreams]) {
+    for (const stream of streams) {
+      try {
+        stream.write(": keepalive\n\n");
+      } catch {
+        streams.delete(stream);
+      }
     }
   }
 }, 20_000).unref();
@@ -423,13 +480,41 @@ function isOpen(ws: WebSocket | null): ws is WebSocket {
 
 /** Wire a freshly spawned pty's output into its ring + whatever ws is attached. */
 function wireSession(id: string | undefined, session: PtySession): void {
-  session.pty.onData((data) => {
+  // The PTY's foreground process group: proof of when a command — an agent
+  // included — hands the terminal back, where the rendered screen can only
+  // recognize a prompt by how it looks. See foregroundJob.ts for why this
+  // reads the name the shell answers to rather than the command it was
+  // spawned from, and why an unmoving job has to conclude nothing.
+  let shellJob = "";
+  const jobSampler = sampleOnceOutputSettles(() => {
+    const job = session.pty.process || "";
+    if (!shellJob) shellJob = job || (session.sshTarget ? "ssh" : SHELL);
+    if (id) activityTracker.noteForegroundJob(id, job, shellJob);
+  });
+  /** Everything a client should see: live output, plus the progress bar a
+   *  transfer draws while it runs. Also what history records. */
+  const emit = (data: string) => {
     if (isOpen(session.ws)) session.ws.send(data);
     ringAppend(session.ring, data);
-    if (id) activityTracker.noteOutput(id, data);
+    if (id) {
+      activityTracker.noteOutput(id, data);
+      jobSampler.noteOutput();
+    }
     if (IS_WIN) trackOscCwd(session.pty.pid, data);
+  };
+  // In-band transfer only makes sense across SSH: it exists to reach the
+  // machine the human is on, which a local shell already is. So a local pane
+  // gets an empty pipeline — a pass-through that cannot be talked into popping
+  // a dialog by a stray handshake in its own output.
+  const transfer = createTransferPipeline({
+    protocols: session.sshTarget ? TRANSFER_PROTOCOLS : [],
+    sendToPty: (data) => session.pty.write(data),
+    sendToClient: emit,
   });
+  session.transfer = transfer;
+  session.pty.onData((data) => transfer.fromShell(data));
   session.pty.onExit(({ exitCode, signal }) => {
+    jobSampler.dispose();
     oscCwdByPid.delete(session.pty.pid);
     console.error(
       `[termany] shell exited (pid: ${session.pty.pid}, code: ${exitCode}, signal: ${signal ?? "none"})`
@@ -443,10 +528,11 @@ function wireSession(id: string | undefined, session: PtySession): void {
           `\r\n\x1b[2m[termany] shell exited (code: ${exitCode}, signal: ${signal ?? "none"})\x1b[0m\r\n`
         );
       }
-      session.ws.close();
+      session.ws.close(SHELL_EXIT_CLOSE_CODE, encodeShellExit(exitCode, signal));
     }
     if (id) {
       activityTracker.noteExit(id, exitCode, signal);
+      sshPortForwarding.remove(id);
       // Natural exit — flush final history so it still restores as plain
       // scrollback (cwd/history stay in the DB; only /api/forget wipes them).
       if (session.ring.dirty) {
@@ -466,6 +552,7 @@ function wireSession(id: string | undefined, session: PtySession): void {
 /** Kill a session's live process (if any), preserving its restore history. */
 function killSession(id: string): void {
   activityTracker.remove(id);
+  sshPortForwarding.remove(id);
   const session = ptySessions.get(id);
   if (!session) return;
   if (session.ring.dirty) {
@@ -481,6 +568,28 @@ function killSession(id: string): void {
     /* already gone */
   }
   ptySessions.delete(id);
+}
+
+/**
+ * Drag-and-drop upload, driven by paths the webview harvested from a native OS
+ * file drop. Which protocol carries it, and whatever command it has to type to
+ * get the remote's attention, is the pipeline's business. Only remote panes
+ * have a protocol to offer, so a local one gets a visible refusal instead of a
+ * meaningless local path pasted into the shell.
+ */
+function runUpload(session: PtySession, paths: string[]): void {
+  if (!session.transfer?.canUpload) {
+    if (isOpen(session.ws)) {
+      session.ws.send("\r\n\x1b[31m[termany] file upload is only available on remote (SSH) panes\x1b[0m\r\n");
+    }
+    return;
+  }
+  void session.transfer.startUpload(paths).catch((err) => {
+    const message = err instanceof Error ? err.message : String(err);
+    if (isOpen(session.ws)) {
+      session.ws.send(`\r\n\x1b[31m[termany] upload failed: ${message}\x1b[0m\r\n`);
+    }
+  });
 }
 
 // Safety net: a shell detached (app closed, never reopened) longer than this
@@ -542,6 +651,30 @@ const http = createServer((req, res) => {
     json(500, { error: msg });
   };
   const reqUrl = new URL(req.url ?? "/", "http://localhost");
+
+  if (reqUrl.pathname.startsWith("/gateway/")) {
+    void proxyGatewayRequest(req, res).catch(fail);
+    return;
+  }
+  if (req.method === "GET" && reqUrl.pathname === "/api/model-gateway") {
+    try { json(200, gatewayState(PORT)); } catch (error) { fail(error); }
+    return;
+  }
+  if (req.method === "POST" && reqUrl.pathname.startsWith("/api/model-gateway/")) {
+    readJson(req).then((body) => {
+      const id = String(body?.id ?? "");
+      switch (reqUrl.pathname) {
+        case "/api/model-gateway/routes": saveGatewayRoute(body); break;
+        case "/api/model-gateway/connect": connectGatewayRoute(id, PORT); break;
+        case "/api/model-gateway/disconnect": disconnectGatewayRoute(id); break;
+        case "/api/model-gateway/delete": disconnectGatewayRoute(id, true); break;
+        case "/api/model-gateway/connection": json(200, gatewayConnection(id, PORT)); return;
+        default: json(404, { error: "Unknown gateway operation" }); return;
+      }
+      json(200, gatewayState(PORT));
+    }).catch((error) => json(400, { error: error instanceof Error ? error.message : String(error) }));
+    return;
+  }
 
   // Agent activity is server-owned so every app window reads the same state.
   // SSE pushes complete snapshots, making reconnects self-healing instead of
@@ -626,7 +759,7 @@ const http = createServer((req, res) => {
           id.length > 256 ||
           !Number.isSafeInteger(taskEpoch) ||
           taskEpoch <= 0 ||
-          (status !== "done" && status !== "error") ||
+          (status !== "done" && status !== "error" && status !== "working") ||
           typeof body?.agentActive !== "boolean"
         ) {
           json(400, {
@@ -634,12 +767,19 @@ const http = createServer((req, res) => {
           });
           return;
         }
-        if (status === "error") {
+        let accepted = true;
+        if (status === "working") {
+          // Live busy evidence retracting a premature completion. Epoch-checked
+          // like the others: only the task the screen was watching may resume,
+          // and only while the pty is still the agent's. The verdict is
+          // reported so a refused client stops re-sending it every frame.
+          accepted = activityTracker.reportWorking(id, taskEpoch);
+        } else if (status === "error") {
           activityTracker.reportBlocked(id, taskEpoch);
         } else {
           activityTracker.reportIdle(id, taskEpoch, body.agentActive);
         }
-        json(200, { ok: true, ...activityPayload() });
+        json(200, { ok: true, accepted, ...activityPayload() });
       })
       .catch(fail);
     return;
@@ -672,6 +812,85 @@ const http = createServer((req, res) => {
           providerId: body?.providerId ? String(body.providerId) : undefined,
         }))
       )
+      .catch(fail);
+    return;
+  }
+
+  // Providers for the agent CLIs installed on this machine. Unlike /api/models
+  // (which Termany itself calls), these write into the apps' own configuration
+  // files, so a CLI or desktop app started outside Termany picks them up too.
+  // Keys stay server-side and are masked on read, as in config.ts.
+  if (req.method === "GET" && reqUrl.pathname === "/api/agent-providers") {
+    json(200, providerState());
+    return;
+  }
+  if (req.method === "POST" && reqUrl.pathname === "/api/agent-providers") {
+    readJson(req)
+      .then((body) => {
+        upsertProvider(body);
+        json(200, providerState());
+      })
+      .catch(fail);
+    return;
+  }
+  if (req.method === "POST" && reqUrl.pathname === "/api/agent-providers/delete") {
+    readJson(req)
+      .then((body) => {
+        removeProvider(String(body?.id ?? ""));
+        json(200, providerState());
+      })
+      .catch(fail);
+    return;
+  }
+  // Writes the selection into the app's own config. A null providerId clears
+  // Termany's keys and leaves the app on whatever login it already had.
+  if (req.method === "POST" && reqUrl.pathname === "/api/agent-providers/switch") {
+    readJson(req)
+      .then((body) => {
+        const appId = String(body?.appId ?? "") as AppId;
+        if (!APP_IDS.includes(appId)) throw new Error(`unknown app ${appId}`);
+        const result = applyProvider(appId, body?.providerId ? String(body.providerId) : null);
+        json(200, { ...result, ...providerState() });
+      })
+      .catch(fail);
+    return;
+  }
+  // Preview first: the import is shown as a list before anything is stored.
+  if (req.method === "GET" && reqUrl.pathname === "/api/agent-providers/import") {
+    try {
+      json(200, previewCcSwitchImport());
+    } catch (e) {
+      json(200, { providers: [], error: e instanceof Error ? e.message : String(e) });
+    }
+    return;
+  }
+  if (req.method === "POST" && reqUrl.pathname === "/api/agent-providers/import") {
+    readJson(req)
+      .then((body) => {
+        const ids = Array.isArray(body?.ids) ? body.ids.map(String) : undefined;
+        const result = importCcSwitch(ids);
+        json(200, { ...result, ...providerState() });
+      })
+      .catch(fail);
+    return;
+  }
+  if (req.method === "GET" && reqUrl.pathname === "/api/agent-providers/backups") {
+    const appId = String(reqUrl.searchParams.get("appId") ?? "") as AppId;
+    if (!APP_IDS.includes(appId)) {
+      json(400, { error: `unknown app ${appId}` });
+      return;
+    }
+    json(200, { backups: backups(appId) });
+    return;
+  }
+  if (req.method === "POST" && reqUrl.pathname === "/api/agent-providers/rollback") {
+    readJson(req)
+      .then((body) => {
+        const appId = String(body?.appId ?? "") as AppId;
+        if (!APP_IDS.includes(appId)) throw new Error(`unknown app ${appId}`);
+        const result = rollback(appId, String(body?.id ?? ""));
+        json(200, { ...result, ...providerState() });
+      })
       .catch(fail);
     return;
   }
@@ -739,10 +958,8 @@ const http = createServer((req, res) => {
   if (req.method === "POST" && req.url === "/api/agent/acp/chat") {
     readJson(req)
       .then(async (body) => {
-        const target = await acpTarget(body);
         const prompt = String(body?.prompt ?? "").trim();
         if (!prompt) throw new Error("prompt is required");
-        const { paneId } = target;
         res.writeHead(200, {
           "Content-Type": "application/x-ndjson; charset=utf-8",
           "Cache-Control": "no-cache, no-transform",
@@ -758,9 +975,13 @@ const http = createServer((req, res) => {
           if (!res.writableEnded) res.write(`${JSON.stringify({ type: "heartbeat" })}\n`);
         }, 10_000);
         try {
+          const target = await acpTarget(body);
           await promptAcpRuntime({
             ...target,
             prompt,
+            images: body?.images,
+            botIdentity: body?.botIdentity,
+            applySavedConfig: body?.applySavedConfig === true,
             signal: abort.signal,
             emit: (event) => {
               if (!res.writableEnded) res.write(`${JSON.stringify(event)}\n`);
@@ -793,6 +1014,17 @@ const http = createServer((req, res) => {
         (await resolveSpawnCwd(reqUrl.searchParams.get("cwdFrom"), reqUrl.searchParams.get("paneId")));
       json(200, { cwd, home: os.homedir(), explicit: Boolean(explicitCwd) });
     })().catch(fail);
+    return;
+  }
+
+  // Attach local files by their paths, using the same native picker as terminals.
+  if (req.method === "POST" && req.url === "/api/agent/pick-files") {
+    readJson(req)
+      .then(async (body) => {
+        const paths = await pickFiles(String(body?.prompt ?? "") || "Add attachment");
+        json(200, paths ? { paths } : { cancelled: true });
+      })
+      .catch(fail);
     return;
   }
 
@@ -836,6 +1068,8 @@ const http = createServer((req, res) => {
           "Cache-Control": "no-cache, no-transform",
           Connection: "keep-alive",
         });
+        // Acknowledge delivery before waiting for the provider's first token.
+        res.flushHeaders();
         const abort = new AbortController();
         req.on("aborted", () => abort.abort());
         res.on("close", () => {
@@ -844,7 +1078,7 @@ const http = createServer((req, res) => {
         try {
           const result = await streamAgentChat(body?.model, body?.messages, abort.signal, (text) => {
             if (!res.writableEnded && text) res.write(`${JSON.stringify({ type: "delta", text })}\n`);
-          });
+          }, body?.botIdentity);
           if (!res.writableEnded) res.end(`${JSON.stringify({ type: "done", model: result.model })}\n`);
         } catch (err) {
           if (abort.signal.aborted || res.writableEnded) return;
@@ -860,9 +1094,16 @@ const http = createServer((req, res) => {
   if (req.method === "POST" && req.url === "/api/agents/detect") {
     readJson(req)
       .then(async (body) => {
+        if (Array.isArray(body?.agents)) {
+          const agents = body.agents.slice(0, 64)
+            .map(parseAgentDetectionInput)
+            .filter((agent): agent is NonNullable<typeof agent> => Boolean(agent));
+          json(200, { results: await Promise.all(agents.map((agent) => detectAgentExecutable(agent))) });
+          return;
+        }
         const commands = Array.isArray(body?.commands) ? body.commands.slice(0, 64).map(String) : [];
         const unique = [...new Set(commands.map((command) => command.trim()).filter(Boolean))];
-        json(200, { results: await Promise.all(unique.map(detectExecutable)) });
+        json(200, { results: await Promise.all(unique.map(detectCommandExecutable)) });
       })
       .catch(fail);
     return;
@@ -873,10 +1114,32 @@ const http = createServer((req, res) => {
     json(200, loadState());
     return;
   }
+  if (req.method === "GET" && reqUrl.pathname === "/api/state/events") {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    });
+    stateStreams.add(res);
+    res.write("retry: 1000\n");
+    // Open with a snapshot so a client that reconnects after a dropped stream
+    // catches up on whatever it missed instead of drifting until its next save.
+    // The empty client id belongs to no one, so nobody treats it as an echo.
+    res.write(stateEvent(""));
+    res.on("close", () => stateStreams.delete(res));
+    res.on("error", () => stateStreams.delete(res));
+    return;
+  }
   if (req.method === "PUT" && req.url === "/api/state") {
-    readJson(req)
+    // First-class Agent conversations live beside the workspace layout and can
+    // legitimately carry several bounded transcripts. This remains local-only
+    // and still capped, but needs more room than small settings requests.
+    readJson(req, 8_000_000)
       .then((body) => {
         saveState(body);
+        // `clientId` is the writer's own tag, not part of the layout — it comes
+        // straight back out on the stream so the sender can skip its own echo.
+        stateChanged(typeof body?.clientId === "string" ? body.clientId : "");
         json(200, { ok: true });
       })
       .catch(fail);
@@ -1137,7 +1400,7 @@ const http = createServer((req, res) => {
   // Locally installed CodexThemes packages (~/.codexthemes/themes): list each
   // package's manifest plus artwork/preview file paths, so Appearance can show
   // a one-click gallery. Images are served through the existing /api/fs/media.
-  if (req.method === "GET" && req.url === "/api/codex-themes") {
+  if (req.method === "GET" && reqUrl.pathname === "/api/codex-themes") {
     (async () => {
       const root = path.join(os.homedir(), ".codexthemes", "themes");
       let dirs: fs.Dirent[] = [];
@@ -1181,15 +1444,37 @@ const http = createServer((req, res) => {
   // Per-agent CLI conversation history for the SideRail history browser.
   // Readers live in agentSessions.ts (claude, codex); unknown agents return
   // sessions: null so the frontend can show "not supported" instead of empty.
+  // Repeated `root` params scope the list to sessions under those directories
+  // (the browser passes the current repo's worktree roots); `cursor` + `limit`
+  // page through newest-first transcript headers without full-file token scans.
   if (req.method === "GET" && reqUrl.pathname === "/api/agent-sessions") {
     (async () => {
       const agent = reqUrl.searchParams.get("agent") ?? "claude";
-      json(200, { sessions: await listAgentSessions(agent) });
+      const roots = reqUrl.searchParams.getAll("root").filter(Boolean);
+      const cursor = Number(reqUrl.searchParams.get("cursor") ?? 0);
+      const limit = Number(reqUrl.searchParams.get("limit") ?? DEFAULT_SESSION_PAGE_SIZE);
+      json(200, await listAgentSessions(agent, roots, cursor, limit));
     })().catch(fail);
     return;
   }
 
-  // Daily per-agent/per-model token usage for the SideRail usage dashboard.
+  // Local identity used as the default display name for the human participant
+  // in group conversations. userInfo is authoritative, while the home folder
+  // fallback keeps the endpoint useful in constrained launch environments.
+  if (req.method === "GET" && reqUrl.pathname === "/api/system-profile") {
+    let username = "";
+    try {
+      username = os.userInfo().username.trim();
+    } catch {
+      // Fall through to the home-directory name below.
+    }
+    if (!username) {
+      username = path.basename(os.homedir()).trim();
+    }
+    json(200, { username: username || "user" });
+    return;
+  }
+
   // Which build this server came from. The desktop app probes this on launch to
   // decide whether an already-listening server is safe to reuse; keep it cheap
   // and dependency-free so it answers even if everything else is broken.
@@ -1198,9 +1483,11 @@ const http = createServer((req, res) => {
     return;
   }
 
+  // Daily per-agent/per-model token usage for the SideRail usage dashboard.
+  // `since` defaults to today and is clamped server-side to at most 31 days.
   if (req.method === "GET" && reqUrl.pathname === "/api/agent-usage") {
     (async () => {
-      json(200, { rows: await listAgentUsage() });
+      json(200, { rows: await listAgentUsage(reqUrl.searchParams.get("since")) });
     })().catch(fail);
     return;
   }
@@ -1217,11 +1504,67 @@ const http = createServer((req, res) => {
   // can offer "open in browser" for a dev server that is actually up — and
   // stop offering it the moment that server dies.
   if (req.method === "GET" && reqUrl.pathname === "/api/session-ports") {
+    // This is live process state. In particular, the first request often sees
+    // no ports while a dev server is still booting; a WebView must never cache
+    // that empty response and hide the header button indefinitely.
+    res.setHeader("Cache-Control", "no-store");
     (async () => {
       const rootPids: Record<string, number> = {};
-      for (const [id, session] of ptySessions) rootPids[id] = session.pty.pid;
-      json(200, { ports: await sessionListeningPorts(rootPids) });
+      const remoteIds: string[] = [];
+      for (const [id, session] of ptySessions) {
+        if (session.sshTarget && sshPortForwarding.isRemote(id)) remoteIds.push(id);
+        else rootPids[id] = session.pty.pid;
+      }
+      const [localPorts, remoteEntries] = await Promise.all([
+        sessionListeningPorts(rootPids),
+        Promise.all(
+          remoteIds.map(
+            async (id) => [id, await sshPortForwarding.listRemotePorts(id)] as const,
+          ),
+        ),
+      ]);
+      const ports = { ...localPorts };
+      const forwards: Record<string, ReturnType<SshPortForwarding["snapshot"]>> = {};
+      for (const [id, list] of remoteEntries) {
+        const active = sshPortForwarding.snapshot(id);
+        const visible = [...new Set([...list, ...active.map((item) => item.remotePort)])].sort(
+          (a, b) => a - b,
+        );
+        if (visible.length) ports[id] = visible;
+        forwards[id] = active;
+      }
+      json(200, { ports, remoteSessions: remoteIds, forwards });
     })().catch(fail);
+    return;
+  }
+
+  if (req.method === "POST" && reqUrl.pathname === "/api/ssh-port-forward") {
+    readJson(req)
+      .then(async (body) => {
+        const sessionId = typeof body?.session === "string" ? body.session : "";
+        try {
+          const forward = await sshPortForwarding.forward(sessionId, body?.remotePort);
+          json(200, { ok: true, forward });
+        } catch (error) {
+          json(400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      })
+      .catch(fail);
+    return;
+  }
+
+  if (req.method === "POST" && reqUrl.pathname === "/api/ssh-port-forward/cancel") {
+    readJson(req)
+      .then(async (body) => {
+        const sessionId = typeof body?.session === "string" ? body.session : "";
+        try {
+          await sshPortForwarding.cancel(sessionId, body?.remotePort);
+          json(200, { ok: true });
+        } catch (error) {
+          json(400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      })
+      .catch(fail);
     return;
   }
 
@@ -1242,6 +1585,16 @@ const http = createServer((req, res) => {
         }
       })
       .catch(fail);
+    return;
+  }
+
+  // Cheap repo shape (root + branch + worktree list) for scoping UIs — the
+  // full overview below computes per-worktree diff badges, far too slow for this.
+  if (req.method === "GET" && reqUrl.pathname === "/api/git/worktrees") {
+    (async () => {
+      const cwd = await sessionCwd(reqUrl.searchParams.get("session") ?? "");
+      json(200, await worktreeOverview(cwd));
+    })().catch(fail);
     return;
   }
 
@@ -1338,7 +1691,6 @@ function tryListen(): void {
   listenAttempts++;
   http.listen(PORT, () => {
     console.log(`[termany] PTY server listening on ws://localhost:${PORT}  (shell: ${SHELL})`);
-    warmAgentSessionCache();
   });
 }
 
@@ -1531,7 +1883,15 @@ async function acpTarget(body: any): Promise<AcpRuntimeTarget> {
  * to it after the app is closed and reopened. Runs on an interval (the app may
  * be SIGKILLed on quit, so we can't rely on a shutdown hook) and once at exit.
  */
-async function sweepCwds(): Promise<void> {
+let cwdSweep: Promise<void> | undefined;
+function sweepCwds(): Promise<void> {
+  // A slow lsof sweep must not pile up another full scan every five seconds.
+  if (cwdSweep) return cwdSweep;
+  cwdSweep = collectCwds().finally(() => { cwdSweep = undefined; });
+  return cwdSweep;
+}
+
+async function collectCwds(): Promise<void> {
   for (const [id, session] of ptySessions) {
     const cwd = await dirIfValid(await cwdForPid(session.pty.pid));
     if (cwd) {
@@ -1584,7 +1944,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
       }
       if (msg.type === "input") {
         activityTracker.noteInput(sessionId!, msg.data, agent);
-        existing.pty.write(msg.data);
+        if (!existing.transfer?.fromClient(msg.data)) existing.pty.write(msg.data);
       }
       else if (msg.type === "resize") {
         try {
@@ -1592,6 +1952,10 @@ wss.on("connection", async (ws: WebSocket, req) => {
         } catch {
           /* race during teardown */
         }
+        existing.transfer?.setColumns(Math.max(1, msg.cols));
+      }
+      else if (msg.type === "upload-files") {
+        runUpload(existing, msg.paths);
       }
     });
     ws.on("close", () => {
@@ -1630,13 +1994,16 @@ wss.on("connection", async (ws: WebSocket, req) => {
     }
     if (msg.type === "input") {
       if (sessionId) activityTracker.noteInput(sessionId, msg.data, agent);
-      session.pty.write(msg.data);
+      if (!session.transfer?.fromClient(msg.data)) session.pty.write(msg.data);
     } else if (msg.type === "resize") {
       try {
         session.pty.resize(Math.max(1, msg.cols), Math.max(1, msg.rows));
       } catch {
         /* race during teardown */
       }
+      session.transfer?.setColumns(Math.max(1, msg.cols));
+    } else if (msg.type === "upload-files") {
+      runUpload(session, msg.paths);
     }
   };
 
@@ -1681,8 +2048,18 @@ wss.on("connection", async (ws: WebSocket, req) => {
   });
 
   let sshArgs: string[] | undefined;
+  let sshConnectionArgs: string[] | undefined;
+  let sshControlPath = "";
   try {
-    if (sshTarget) sshArgs = sshArgsForConnection(sshTarget);
+    if (sshTarget) {
+      sshConnectionArgs = sshArgsForConnection(sshTarget);
+      sshArgs = sshConnectionArgs;
+      if (sessionId) {
+        const prepared = sshPortForwarding.prepare(sessionId, sshTarget, sshArgs);
+        sshArgs = prepared.args;
+        sshControlPath = prepared.controlPath;
+      }
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (ws.readyState === ws.OPEN) {
@@ -1702,7 +2079,7 @@ wss.on("connection", async (ws: WebSocket, req) => {
       cols: 80,
       rows: 24,
       cwd,
-      env: ptyEnvironment(),
+      env: ptyEnvironment(process.env, process.platform, sessionId ?? undefined),
     });
   } catch (err) {
     // Never let one bad spawn take down the whole server.
@@ -1724,6 +2101,9 @@ wss.on("connection", async (ws: WebSocket, req) => {
   };
   if (sessionId) ptySessions.set(sessionId, session);
   else ephemeralSessions.add(session);
+  if (sessionId && sshTarget && sshConnectionArgs) {
+    sshPortForwarding.register(sessionId, sshConnectionArgs, sshControlPath);
+  }
   if (sessionId) activityTracker.bindAgent(sessionId, agent);
   wireSession(sessionId ?? undefined, session);
 

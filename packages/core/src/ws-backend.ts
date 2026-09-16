@@ -1,4 +1,4 @@
-import type { ClientMessage, ITerminalBackend } from "./backend.js";
+import { parseShellExit, type ClientMessage, type ITerminalBackend, type ShellExit } from "./backend.js";
 
 // The bundled server boots in parallel with the webview and can lose the race
 // by a few hundred ms — retry the INITIAL connection instead of declaring the
@@ -26,7 +26,7 @@ export class WebSocketBackend implements ITerminalBackend {
   private retryTimer: ReturnType<typeof setTimeout> | undefined;
   private outbox: string[] = [];
   private dataCb?: (data: string) => void;
-  private exitCb?: (reason?: string) => void;
+  private exitCb?: (reason?: string, exit?: ShellExit) => void;
 
   constructor(url: string, params?: Record<string, string | undefined>) {
     const wsUrl = new URL(url);
@@ -49,18 +49,22 @@ export class WebSocketBackend implements ITerminalBackend {
     this.ws.onmessage = (e) => {
       if (typeof e.data === "string") this.dataCb?.(e.data);
     };
-    this.ws.onclose = () => {
+    this.ws.onclose = (event) => {
       this.open = false;
       if (this.disposed) return;
       if (!this.everOpened && this.attempts < MAX_CONNECT_ATTEMPTS) {
         this.retryTimer = setTimeout(() => this.connect(), RETRY_DELAY_MS * this.attempts);
         return;
       }
-      this.exitCb?.(
-        this.everOpened
-          ? undefined
-          : `unable to connect to Termany PTY server at ${this.url.host}`
-      );
+      if (!this.everOpened) {
+        this.exitCb?.(`unable to connect to Termany PTY server at ${this.url.host}`);
+        return;
+      }
+      // A close AFTER the socket opened is a real session end. The server
+      // stamps the frame with how the shell died when it knows; anything else
+      // (its own shutdown, a newer connection displacing us) arrives without a
+      // payload and stays "unknown" to the caller.
+      this.exitCb?.(undefined, parseShellExit(event.code, event.reason));
     };
   }
 
@@ -68,12 +72,16 @@ export class WebSocketBackend implements ITerminalBackend {
     this.dataCb = cb;
   }
 
-  onExit(cb: (reason?: string) => void) {
+  onExit(cb: (reason?: string, exit?: ShellExit) => void) {
     this.exitCb = cb;
   }
 
   write(data: string) {
     this.send({ type: "input", data });
+  }
+
+  uploadFiles(paths: string[]) {
+    this.send({ type: "upload-files", paths });
   }
 
   resize(cols: number, rows: number) {

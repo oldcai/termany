@@ -11,6 +11,8 @@
  * distinct, which is what makes rebinding predictable.
  */
 
+import { isTauri } from "./env";
+
 /** A single key combination. `code` is a KeyboardEvent.code (e.g. "KeyT"). */
 export interface Chord {
   code: string;
@@ -35,6 +37,12 @@ export interface ActionDef {
    * Still fully bindable and listed in Settings → Keyboard.
    */
   hideInPalette?: true;
+  /**
+   * Drop the action entirely outside the desktop shell — for the ones with
+   * nothing to act on in a browser tab, where the OS chrome isn't ours. Unlike
+   * `hideInPalette` this also unbinds the chord and hides the Settings row.
+   */
+  desktopOnly?: true;
 }
 
 /** The platform's conventional application-shortcut modifier. */
@@ -78,7 +86,7 @@ const ACTION_DEFINITIONS: ActionDef[] = [
   { id: "resizePaneRight", label: "Move divider right", group: "Tabs & panes", default: { code: "ArrowRight", meta: true, ctrl: true } },
   { id: "resizePaneUp", label: "Move divider up", group: "Tabs & panes", default: { code: "ArrowUp", meta: true, ctrl: true } },
   { id: "resizePaneDown", label: "Move divider down", group: "Tabs & panes", default: { code: "ArrowDown", meta: true, ctrl: true } },
-  { id: "togglePaneView", label: "Cycle terminal / files / git diff / conversation / browser view", group: "Tabs & panes", default: { code: "KeyE", meta: true } },
+  { id: "togglePaneView", label: "Cycle visible pane views", group: "Tabs & panes", default: { code: "KeyE", meta: true } },
   { id: "zoomTerminalIn", label: "Increase terminal text size", group: "Appearance", default: { code: "Equal", meta: true, shift: true } },
   { id: "zoomTerminalOut", label: "Decrease terminal text size", group: "Appearance", default: { code: "Minus", meta: true } },
   { id: "resetTerminalZoom", label: "Reset terminal text size", group: "Appearance", default: { code: "Digit0", meta: true } },
@@ -106,6 +114,10 @@ const ACTION_DEFINITIONS: ActionDef[] = [
   { id: "newPage", label: "New page", group: "Navigation", default: { code: "KeyN", meta: true } },
   { id: "newChildPage", label: "New child page", group: "Navigation", default: { code: "Enter", meta: true } },
   { id: "newWorkspace", label: "New workspace", group: "Navigation", default: { code: "KeyN", meta: true, shift: true } },
+  // ⌘N and ⌘⇧N are already the two entries above, so the third "new" lands on
+  // ⌥⌘N. The macOS Window menu deliberately leaves its New Window item without
+  // a keyEquivalent so this binding stays the only one, and stays rebindable.
+  { id: "newWindow", label: "New window", group: "Navigation", default: { code: "KeyN", meta: true, alt: true }, desktopOnly: true },
   { id: "nextWorkspace", label: "Next workspace", group: "Navigation", default: { code: "BracketRight", meta: true, ctrl: true } },
   { id: "prevWorkspace", label: "Previous workspace", group: "Navigation", default: { code: "BracketLeft", meta: true, ctrl: true } },
   { id: "previousTheme", label: "Previous theme", group: "Appearance", default: { code: "Comma", meta: true, alt: true } },
@@ -131,7 +143,9 @@ const ACTION_DEFINITIONS: ActionDef[] = [
 ];
 
 /** Platform-native action catalog consumed by matching, settings and xterm. */
-export const ACTIONS: ActionDef[] = ACTION_DEFINITIONS.map((action) => ({
+export const ACTIONS: ActionDef[] = ACTION_DEFINITIONS.filter(
+  (action) => !action.desktopOnly || isTauri
+).map((action) => ({
   ...action,
   default: chordForPlatform(action.default),
 }));

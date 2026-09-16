@@ -1,18 +1,26 @@
+import { toggleWorkspaceSwitcher } from "../workspaceSwitcherEvents";
+import { PageDragGesture } from "../pageDragGesture";
+import { textInputProps } from "../textInputProps";
 import { PointerEvent as ReactPointerEvent, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { beginDragCursor, createDragGhost, endDragCursor, type DragGhost } from "../dragGhost";
 import { useI18n } from "../i18n";
+import { useImeGuard } from "../imeGuard";
 import { withShortcut } from "../keybindings";
-import { activeWorkspace, HTAB_DRAG_MIME, useStore, type TreeNode } from "../state/store";
+import { closeBlockers } from "../closeGuard";
+import { activePageId, activeWorkspace, HTAB_DRAG_MIME, useStore, type TreeNode } from "../state/store";
 import {
   acknowledgeAgentActivities,
   agentActivitySummary,
+  agentActivitySummaryForSessions,
   agentActivitySnapshot,
   agentActivityTitle,
+  hasActiveAgentSession,
+  ownedSessionIds,
   subscribeAgentActivity,
   type AgentActivityStatus,
 } from "../terminal/manager";
 import { ChevronIcon, CloseIcon, CollapseAllIcon, PageIcon, PlusIcon } from "./icons";
-import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
+import { CloseConfirm } from "./CloseConfirm";
 
 const DRAG_MIME = "application/x-termany-node";
 const ACTIVITY_STATUSES = ["working", "done", "error"] as const;
@@ -52,8 +60,9 @@ const ACTIVITY_RANK: Record<AgentActivityStatus, number> = { error: 3, working: 
 
 function collectActiveEntries(nodes: TreeNode[], trail: string[] = [], out: ActiveEntry[] = []) {
   for (const node of nodes) {
-    const activity = agentActivitySummary(ownLeafIds(node));
-    if (activity.working || activity.done || activity.error) out.push({ node, trail, activity });
+    const leafIds = ownLeafIds(node);
+    const activity = agentActivitySummary(leafIds);
+    if (hasActiveAgentSession(leafIds)) out.push({ node, trail, activity });
     collectActiveEntries(node.children, [...trail, node.title], out);
   }
   return out;
@@ -93,7 +102,7 @@ function ActivityCounts({ activity }: { activity: ReturnType<typeof agentActivit
  */
 function ActiveItem({ entry }: { entry: ActiveEntry }) {
   const { node, trail, activity } = entry;
-  const activeId = useStore((s) => activeWorkspace(s).activeNode);
+  const activeId = useStore(activePageId);
   const setActiveNode = useStore((s) => s.setActiveNode);
   const viewedLeafIds = node.htabs
     .filter((tab) => tab.id === node.activeHTab)
@@ -133,7 +142,10 @@ function TreeItem({
   consumeSuppressedClick: () => boolean;
 }) {
   const { t } = useI18n();
-  const activeId = useStore((s) => activeWorkspace(s).activeNode);
+  const activeId = useStore(activePageId);
+  // Open in another window: still clickable — selecting it raises that window —
+  // but it can't be deleted from here, and it doesn't become this window's page.
+  const elsewhere = useStore((s) => s.takenPages.has(node.id));
   const setActiveNode = useStore((s) => s.setActiveNode);
   const toggleExpand = useStore((s) => s.toggleExpand);
   const addChildNode = useStore((s) => s.addChildNode);
@@ -142,6 +154,8 @@ function TreeItem({
   const moveNode = useStore((s) => s.moveNode);
   const moveHTab = useStore((s) => s.moveHTab);
   const [editing, setEditing] = useState(false);
+  const [pendingClose, setPendingClose] = useState<{ working: number; error: number } | null>(null);
+  const ime = useImeGuard();
   // Where a drag over this row would land: nest into it, or reorder as a
   // sibling before/after it (top/bottom quarter of the row).
   const [dropPos, setDropPos] = useState<TreeDropPos | null>(null);
@@ -159,6 +173,8 @@ function TreeItem({
     <>
       <div
         className={`tree-row ${node.id === activeId ? "active" : ""} ${
+          elsewhere ? "elsewhere" : ""
+        } ${
           activeDropPos === "into" ? "drop-target" : ""
         } ${activeDropPos === "before" ? "drop-before" : ""} ${
           activeDropPos === "after" ? "drop-after" : ""
@@ -238,6 +254,8 @@ function TreeItem({
 
         {editing ? (
           <input
+            {...textInputProps}
+            {...ime.props}
             className="tree-rename"
             autoFocus
             defaultValue={node.title}
@@ -247,7 +265,7 @@ function TreeItem({
               setEditing(false);
             }}
             onKeyDown={(e) => {
-              if (e.nativeEvent.isComposing) return; // let the IME handle Enter/Esc
+              if (ime.handled(e)) return; // the IME is still using this key
               if (e.key === "Enter") (e.target as HTMLInputElement).blur();
               else if (e.key === "Escape") setEditing(false);
             }}
@@ -273,16 +291,23 @@ function TreeItem({
         >
           <PlusIcon />
         </button>
-        <button
-          className="tree-act"
-          title={t("sidebar.deletePageTree")}
-          onClick={(e) => {
-            e.stopPropagation();
-            deleteNode(node.id);
-          }}
-        >
-          <CloseIcon />
-        </button>
+        {!elsewhere && (
+          <button
+            className="tree-act"
+            title={t("sidebar.deletePageTree")}
+            onClick={(e) => {
+              e.stopPropagation();
+              const blockers = closeBlockers(
+                agentActivitySummaryForSessions(ownedSessionIds(subtreeLeafIds(node))),
+              );
+              if (blockers) setPendingClose(blockers);
+              else deleteNode(node.id);
+            }}
+          >
+            <CloseIcon />
+          </button>
+        )}
+        {elsewhere && <span className="tree-elsewhere" title={t("sidebar.openInOtherWindow")} />}
         {node.htabs.length > 1 && (
           <span className="tree-count" title={t("sidebar.terminals", { count: node.htabs.length })}>
             {node.htabs.length}
@@ -302,14 +327,29 @@ function TreeItem({
             consumeSuppressedClick={consumeSuppressedClick}
           />
         ))}
+      {pendingClose && (
+        <CloseConfirm
+          kind="page"
+          name={node.title}
+          working={pendingClose.working}
+          error={pendingClose.error}
+          onConfirm={() => {
+            deleteNode(node.id);
+            setPendingClose(null);
+          }}
+          onClose={() => setPendingClose(null)}
+        />
+      )}
     </>
   );
 }
 
 /** Left sidebar: the workspace's node tree. */
-export function TreeSidebar({ onOpenSettings }: { onOpenSettings: () => void }) {
+export function TreeSidebar() {
   const { t } = useI18n();
   const ws = useStore(activeWorkspace);
+  const botEnabled = useStore((s) => s.botEnabled);
+  const activePage = useStore(activePageId);
   const addRootNode = useStore((s) => s.addRootNode);
   const collapseAll = useStore((s) => s.collapseAll);
   const moveNode = useStore((s) => s.moveNode);
@@ -326,21 +366,12 @@ export function TreeSidebar({ onOpenSettings }: { onOpenSettings: () => void }) 
   // ⌘P jumps don't yank the sidebar around.
   useEffect(() => {
     treeRef.current
-      ?.querySelector(`[data-tree-node-id="${CSS.escape(ws.activeNode)}"]`)
+      ?.querySelector(`[data-tree-node-id="${CSS.escape(activePage)}"]`)
       ?.scrollIntoView({ block: "nearest" });
-  }, [ws.activeNode, ws.roots]);
-  const dragRef = useRef<{
-    id: string;
-    title: string;
-    pointerId: number;
-    startX: number;
-    startY: number;
-    active: boolean;
-  } | null>(null);
-  // Cursor-following label, created once the drag passes the 4px threshold.
+  }, [activePage, ws.roots]);
+  const gestureRef = useRef(new PageDragGesture<{ id: string; title: string }>());
   const ghostRef = useRef<DragGhost | null>(null);
   const dragUiRef = useRef<NodeDragUi | null>(null);
-  const suppressClickRef = useRef(false);
   const wsLeafIds = ws.roots.flatMap(subtreeLeafIds);
   useSyncExternalStore(
     subscribeAgentActivity,
@@ -357,47 +388,48 @@ export function TreeSidebar({ onOpenSettings }: { onOpenSettings: () => void }) 
     if (collapsed) return;
     const tree = treeRef.current;
     const row = Array.from(tree?.querySelectorAll<HTMLElement>("[data-tree-node-id]") ?? [])
-      .find((candidate) => candidate.dataset.treeNodeId === ws.activeNode);
+      .find((candidate) => candidate.dataset.treeNodeId === activePage);
     row?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [collapsed, ws.activeNode, ws.id]);
+  }, [collapsed, activePage, ws.id]);
 
   const setDragUi = (next: NodeDragUi | null) => {
     dragUiRef.current = next;
     setNodeDrag(next);
   };
 
+  const clearDragFeedback = () => {
+    if (ghostRef.current) {
+      ghostRef.current.destroy();
+      ghostRef.current = null;
+      endDragCursor();
+    }
+    setDragUi(null);
+  };
+
   const startNodePointerDrag = (id: string, e: ReactPointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0) return;
+    if (e.button !== 0 || !e.isPrimary) return;
+    // Also discard any stale gesture when a new physical press arrives.
+    gestureRef.current.cancel();
+    clearDragFeedback();
     const target = e.target instanceof Element ? e.target : null;
     if (target?.closest("button,input")) return;
-    // Resolve the title now, while the tree is in scope — the pointer handlers
-    // below live in an effect that only re-subscribes on moveNode.
     const title = target?.closest<HTMLElement>("[data-tree-node-id]")?.innerText.trim() || "page";
-    dragRef.current = {
-      id,
-      title: title.split("\n")[0],
-      pointerId: e.pointerId,
-      startX: e.clientX,
-      startY: e.clientY,
-      active: false,
-    };
+    gestureRef.current.start(e.pointerId, e.clientX, e.clientY, { id, title: title.split("\n")[0] });
   };
 
-  const consumeSuppressedClick = () => {
-    if (!suppressClickRef.current) return false;
-    suppressClickRef.current = false;
-    return true;
-  };
+  const consumeSuppressedClick = () => gestureRef.current.consumeClick();
 
   useEffect(() => {
+    const cancelDrag = () => {
+      gestureRef.current.cancel();
+      clearDragFeedback();
+    };
     const onPointerMove = (e: PointerEvent) => {
-      const drag = dragRef.current;
-      if (!drag || e.pointerId !== drag.pointerId) return;
-      if (!drag.active) {
-        const dx = e.clientX - drag.startX;
-        const dy = e.clientY - drag.startY;
-        if (Math.hypot(dx, dy) < 4) return;
-        drag.active = true;
+      const action = gestureRef.current.move(e);
+      if (action === "cancel") { clearDragFeedback(); return; }
+      if (action === "ignore") return;
+      const drag = gestureRef.current.data!;
+      if (action === "start") {
         ghostRef.current = createDragGhost(drag.title);
         beginDragCursor();
       }
@@ -428,38 +460,50 @@ export function TreeSidebar({ onOpenSettings }: { onOpenSettings: () => void }) 
     };
 
     const onPointerUp = (e: PointerEvent) => {
-      const drag = dragRef.current;
-      if (!drag || e.pointerId !== drag.pointerId) return;
-      const wasActive = drag.active;
+      const drag = gestureRef.current.release(e.pointerId);
+      if (!drag) return;
       const ui = dragUiRef.current;
-      dragRef.current = null;
-      ghostRef.current?.destroy();
-      ghostRef.current = null;
-      endDragCursor();
-      setDragUi(null);
-      if (!wasActive) return;
-      suppressClickRef.current = true;
+      clearDragFeedback();
       if (!ui?.overTree) return;
       if (ui.targetId) moveNode(drag.id, ui.targetId, ui.pos ?? "into");
       else moveNode(drag.id, null);
     };
-
-    window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", onPointerUp);
-    window.addEventListener("pointercancel", onPointerUp);
-    return () => {
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", onPointerUp);
-      window.removeEventListener("pointercancel", onPointerUp);
+    const onPointerCancel = (e: PointerEvent) => {
+      if (gestureRef.current.cancel(e.pointerId)) clearDragFeedback();
     };
-  }, [moveNode]);
+    const onVisibilityChange = () => {
+      if (document.hidden) cancelDrag();
+    };
+
+    // Capture release/cancellation before nested controls can swallow them.
+    window.addEventListener("pointermove", onPointerMove, true);
+    window.addEventListener("pointerup", onPointerUp, true);
+    window.addEventListener("pointercancel", onPointerCancel, true);
+    window.addEventListener("blur", cancelDrag);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove, true);
+      window.removeEventListener("pointerup", onPointerUp, true);
+      window.removeEventListener("pointercancel", onPointerCancel, true);
+      window.removeEventListener("blur", cancelDrag);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      cancelDrag();
+    };
+  }, [moveNode, ws.id]);
 
   return (
     <div className="sidebar">
-      <WorkspaceSwitcher onOpenSettings={onOpenSettings} />
-      {/* Pages with agent work of their own, hoisted above the tree — in a long
-          sidebar the busy page is often scrolled out of sight. Only rendered
-          when something is actually running, so it costs nothing when idle. */}
+      {!botEnabled && (
+        <button className="sidebar-workspace-switcher" title={ws.title} onClick={toggleWorkspaceSwitcher}>
+          <span className={`ws-avatar${ws.icon ? " emoji" : ""}`} aria-hidden="true">
+            {ws.icon ?? (ws.title.trim().charAt(0).toUpperCase() || "?")}
+          </span>
+          <span className="sidebar-workspace-name">{ws.title}</span>
+          <ChevronIcon dir="down" />
+        </button>
+      )}
+      {/* Pages whose own panes are still inside an agent TUI, hoisted above the
+          tree. Task state is independent and stays in the traffic-light counts. */}
       {activeEntries.length > 0 && (
         <div className="active-section">
           <div className="section-head">

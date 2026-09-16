@@ -7,6 +7,21 @@ import {
 } from "../keybindings";
 import { disposePaneSessions } from "../terminal/manager";
 import { applyTheme, loadThemeId, THEMES } from "../themes";
+import {
+  loadRailVisibility,
+  saveRailVisibility,
+  type RailItemId,
+  type RailVisibility,
+} from "../rail-config";
+import { claimPage, readWindowPref, writeWindowPref } from "./windows";
+import { stepWorkspace } from "./layoutMerge";
+import { focusPane, focusPaneAfterRemoval, selectHTab } from "./paneFocus";
+import { nextCyclablePaneView } from "./paneViewCycle";
+import { groupControllerSessionId, groupMemberIds, groupMemberSessionId } from "../agentGroupChat";
+import { deliverA2AReply, directA2ASessionId } from "../agentA2A";
+import { agentConversationTopicSessionId, agentConversationTopics, allAgentConversationMessages, groupTopicTitle } from "../agentGroupTopics";
+import { deliverPrivateMessages, unreadAgentMessages, type AgentPrivateMessage } from "../agentPrivateMessages";
+import { removeAgentConversation } from "../agentConversationDeletion";
 
 /**
  * Notion-style model:
@@ -28,7 +43,16 @@ import { applyTheme, loadThemeId, THEMES } from "../themes";
  *
  * A leaf's `id` is the terminal session id in the registry.
  */
-export type PaneView = "terminal" | "files" | "git" | "agent" | "web" | "monitor";
+export type PaneView =
+  | "terminal"
+  | "files"
+  | "git"
+  | "agent"
+  | "web"
+  | "monitor"
+  | "history"
+  | "usage"
+  | "providers";
 
 /** One slice of a reply, in arrival order: prose or a tool invocation.
  *  `status` is the ACP tool-call status: pending | in_progress | completed | failed.
@@ -38,11 +62,34 @@ export type AgentPart =
   | { kind: "text"; text: string }
   | { kind: "tool"; id: string; title: string; status?: string; input?: string; output?: string };
 
+export interface AgentImageAttachment {
+  id: string;
+  kind: "image";
+  /** Local path returned by the clipboard-image endpoint. */
+  path: string;
+  mimeType: string;
+}
+
+export interface AgentFileAttachment {
+  id: string;
+  kind: "file";
+  path: string;
+  name: string;
+}
+
+export interface AgentBotDelivery {
+  id: string;
+  recipient: { id: string; name: string };
+  content: string;
+}
+
 export interface AgentMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   createdAt: number;
+  attachments?: AgentImageAttachment[];
+  files?: AgentFileAttachment[];
   /** The reply interleaved with the tool calls that produced it (ACP runtimes).
    *  Only present when at least one tool ran; `content` stays the full text. */
   parts?: AgentPart[];
@@ -50,6 +97,39 @@ export interface AgentMessage {
   durationMs?: number;
   /** Why the reply stopped, rendered in place of (or after) the content. */
   error?: string;
+  /** A safe recovery action offered when the runtime could not answer. */
+  recovery?: { action: "open-agent-terminal"; agentId: string };
+  /** Attribution remains readable even after a Bot is removed from the group. */
+  sender?: { id: string; name: string };
+  recipient?: { id: string; name: string };
+  recipients?: { id: string; name: string }[];
+  /** A proactive private message delivered to the human's Bot inbox. */
+  sourceGroup?: { id: string; name: string };
+  /** A reply produced after another Bot delegated work into this inbox. */
+  sourceBot?: { id: string; name: string };
+  /** The exact request received from sourceBot, shown before the delegated reply. */
+  sourceBotMessage?: string;
+  /** Exact A2A requests emitted by this reply, shown in the source conversation. */
+  botDeliveries?: AgentBotDelivery[];
+  /** Consecutive bubbles produced by one model turn share this id. */
+  replyGroupId?: string;
+  /** Model-generated first message for a Topic, before the human has spoken. */
+  openingGreeting?: boolean;
+  /** Stable snapshot of the message this user message answers. */
+  replyTo?: { id: string; content: string };
+}
+
+export interface AgentGroupTopic {
+  id: string;
+  title: string;
+  createdAt: number;
+  updatedAt: number;
+  agentMessages?: AgentMessage[];
+}
+
+export interface UserProfile {
+  nickname: string;
+  avatar?: string;
 }
 
 export type Pane =
@@ -112,6 +192,57 @@ export type Pane =
       sizes?: number[];
     };
 
+/** A first-class conversation in the Agents workspace. It uses the same leaf
+ * shape as an in-page Agent pane so both surfaces share one chat runtime. */
+export type AgentConversation = Extract<Pane, { kind: "leaf" }> & {
+  /** Conversations belong to the same top-level workspace as Pages. Optional
+   * only so layouts saved before Agents gained workspace scoping migrate into
+   * the first workspace without losing their transcript. */
+  workspaceId?: string;
+  createdAt: number;
+  updatedAt: number;
+  agentTags?: string;
+  agentDescription?: string;
+  agentNotifications?: boolean;
+  /** A small, locally stored image; empty/absent uses the runtime's icon. */
+  agentAvatar?: string;
+  /** Topic-backed private chat history. Missing means a legacy transcript in
+   * `agentMessages`, which is materialized on the first Topic operation. */
+  agentTopics?: AgentGroupTopic[];
+  agentActiveTopicId?: string;
+  /** Absent for a private Bot conversation. */
+  agentGroup?: {
+    memberIds: string[];
+    /** Member whose own Agent/Model coordinates unaddressed group work. */
+    leadMemberId?: string;
+    runtimeId?: string;
+    topics?: AgentGroupTopic[];
+    activeTopicId?: string;
+  };
+  agentPrivateMessages?: AgentPrivateMessage[];
+  agentReadAt?: number;
+  /** Number of completed assistant messages not yet viewed in this conversation.
+   * Kept explicitly so ordinary replies, group replies and private deliveries
+   * share one unread model without reconstructing UI visibility from timestamps. */
+  agentUnread?: number;
+  /** Sidebar organization only; unrelated to multi-Bot group chats. */
+  agentFolderId?: string;
+  agentPinned?: boolean;
+  agentSortOrder?: number;
+};
+
+export interface AgentConversationFolder {
+  id: string;
+  title: string;
+  createdAt: number;
+  collapsed?: boolean;
+}
+
+export type AgentConversationMeta = Pick<
+  AgentConversation,
+  "title" | "agentTags" | "agentDescription" | "agentNotifications" | "agentAvatar"
+>;
+
 /** Which side of a target pane a drag is dropping onto. */
 export type DropEdge = "left" | "right" | "top" | "bottom";
 
@@ -126,8 +257,15 @@ export interface HTab {
   id: string;
   title: string;
   layout: Pane;
-  /** The focused leaf (session id) — where split/close act and keyboard goes. */
+  /**
+   * The canonical focused leaf (session id). The ring, keyboard target and all
+   * pane actions derive from this same id; imperative DOM focus is never stored
+   * separately.
+   */
   focused: string;
+  /** Earlier focused panes, newest first. Excludes `focused`; optional so old
+   * persisted layouts migrate lazily on their first focus transition. */
+  focusHistory?: string[];
   /** When set, only this leaf is shown, filling the tab (Wave-style magnify). */
   maximized?: string;
   /**
@@ -153,12 +291,65 @@ export interface Workspace {
   /** Emoji icon; when unset the UI falls back to the title's first letter. */
   icon?: string;
   roots: TreeNode[];
-  activeNode: string;
+  /** User-created sections in the Agents inbox. */
+  agentConversationFolders?: AgentConversationFolder[];
+  /** Optional custom label for the built-in section that holds unfiled conversations. */
+  agentUngroupedTitle?: string;
+  agentUngroupedCollapsed?: boolean;
 }
 
 interface State {
   workspaces: Workspace[];
+  /** Conversations shown in the top-level Agents workspace. */
+  agentConversations: AgentConversation[];
+  userProfile: UserProfile;
+  setUserProfile: (patch: Partial<UserProfile>) => void;
+  /**
+   * The workspace THIS window is showing. Unlike everything under it, this is
+   * per-window rather than shared — see state/windows.ts. Change it through
+   * `setActiveWorkspace`, never with a bare `set`, so ownership stays honest.
+   */
   activeWorkspace: string;
+  /**
+   * Which page each workspace is showing IN THIS WINDOW (`workspace id` →
+   * `page id`). Every window renders the same workspaces, tabs and panes; where
+   * each one is looking is its own business, which is what lets a second
+   * monitor hold a different page of the same project. Persisted per window,
+   * not to the server — see state/windows.ts.
+   */
+  activeNodes: Record<string, string>;
+  /**
+   * Pages another window currently has open. Selecting one raises that window
+   * instead of opening it here: a page owns live terminals, and the PTY server
+   * keeps a single socket per pane. Always empty in a browser.
+   */
+  takenPages: Set<string>;
+  setTakenPages: (taken: Set<string>) => void;
+
+  addAgentConversation: (runtimeId?: string, title?: string) => string;
+  addAgentGroup: (title: string, memberIds: string[], workspaceId: string) => string | null;
+  setAgentGroupMembers: (id: string, memberIds: string[]) => void;
+  setAgentGroupLeadMember: (id: string, memberId: string) => void;
+  addAgentTopic: (id: string) => string | null;
+  setActiveAgentTopic: (id: string, topicId: string) => void;
+  renameAgentTopic: (id: string, topicId: string, title: string) => void;
+  deleteAgentTopic: (id: string, topicId: string) => void;
+  setAgentTopicMessages: (id: string, topicId: string, messages: AgentMessage[]) => void;
+  deleteAgentConversation: (id: string) => void;
+  setAgentConversationMeta: (id: string, patch: Partial<AgentConversationMeta>) => void;
+  addAgentConversationFolder: (workspaceId: string, title: string, beforeFolderId?: string) => string;
+  renameAgentConversationFolder: (workspaceId: string, folderId: string, title: string) => void;
+  moveAgentConversationFolder: (workspaceId: string, folderId: string, direction: -1 | 1) => void;
+  deleteAgentConversationFolder: (workspaceId: string, folderId: string) => void;
+  setAgentUngroupedTitle: (workspaceId: string, title: string) => void;
+  setAgentUngroupedCollapsed: (workspaceId: string, collapsed: boolean) => void;
+  setAgentConversationFolderCollapsed: (workspaceId: string, folderId: string, collapsed: boolean) => void;
+  setAgentConversationPinned: (id: string, pinned: boolean) => void;
+  organizeAgentConversations: (updates: Array<Pick<AgentConversation,
+    "id" | "agentFolderId" | "agentPinned" | "agentSortOrder">>) => void;
+  deliverAgentPrivateMessages: (groupId: string, messages: AgentPrivateMessage[]) => void;
+  deliverAgentA2AReply: (recipientId: string, message: AgentMessage) => void;
+  markAgentConversationRead: (id: string) => void;
 
   /** Active theme id (see themes.ts). Persisted to localStorage. */
   theme: string;
@@ -173,6 +364,14 @@ interface State {
   /** Whether the right quick-action rail is hidden. */
   railCollapsed: boolean;
   toggleRail: () => void;
+
+  /** Whether the Bot workspace and app navigation are enabled. Persisted locally. */
+  botEnabled: boolean;
+  setBotEnabled: (enabled: boolean) => void;
+
+  /** Which quick actions appear in the right rail. Persisted locally. */
+  railVisibility: RailVisibility;
+  setRailItemVisible: (id: RailItemId, visible: boolean) => void;
 
   /** Version of an available desktop update (badges + About), or null. */
   updateVersion: string | null;
@@ -259,7 +458,7 @@ interface State {
   prevPane: () => void;
   renamePane: (leafId: string, title: string) => void;
   setPaneAgentSession: (leafId: string, info: { agent: string; sessionId: string }) => void;
-  setAgentMessages: (leafId: string, messages: AgentMessage[]) => void;
+  setAgentMessages: (leafId: string, messages: AgentMessage[], removedMessageIds?: readonly string[]) => void;
   setAgentModel: (leafId: string, model: string) => void;
   setAgentConfigOption: (leafId: string, agentId: string, configId: string, value: string) => void;
   setAgentRuntime: (leafId: string, runtimeId: string) => void;
@@ -316,8 +515,39 @@ const id = () => crypto.randomUUID();
 // Rearranging (movePane) doesn't change the count, so it isn't gated by this.
 const MAX_PANES_PER_TAB = 6;
 
+// The chat UI renders these in pages of 40, so retaining a deeper rolling
+// transcript no longer means mounting every historical message at once.
+const MAX_PERSISTED_AGENT_MESSAGES = 400;
+
 function makeLeaf(title = "pane 1", cwdFrom?: string): Pane & { kind: "leaf" } {
   return { kind: "leaf", id: id(), title, cwdFrom };
+}
+
+function makeAgentConversation(runtimeId?: string, workspaceId?: string, title = "New bot"): AgentConversation {
+  const now = Date.now();
+  const topicId = id();
+  return {
+    ...makeLeaf(title),
+    workspaceId,
+    view: "agent",
+    agentRuntime: runtimeId,
+    agentNotifications: true,
+    agentTopics: [{ id: topicId, title: "", createdAt: now, updatedAt: now }],
+    agentActiveTopicId: topicId,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+function withAgentTopics(
+  conversation: AgentConversation,
+  topics: AgentGroupTopic[],
+  activeTopicId: string | undefined
+): AgentConversation {
+  const base = { ...conversation, agentMessages: undefined };
+  return conversation.agentGroup
+    ? { ...base, agentGroup: { ...conversation.agentGroup, topics, activeTopicId } }
+    : { ...base, agentTopics: topics, agentActiveTopicId: activeTopicId };
 }
 
 /** Default pane labels are scoped to a tab and keep increasing even if an
@@ -354,6 +584,31 @@ export function findLeaf(pane: Pane, leafId: string): (Pane & { kind: "leaf" }) 
     if (hit) return hit;
   }
   return undefined;
+}
+
+/** Apply the one canonical focus transition while preserving the rest of a tab. */
+function withFocusedPane(tab: HTab, paneId: string, layout = tab.layout): HTab {
+  const next = focusPane(tab, paneId, leafIds(layout));
+  if (next === tab) return tab;
+  return { ...tab, focused: next.focused, focusHistory: next.focusHistory };
+}
+
+/** Apply a pane removal, including focus history and maximized-pane cleanup. */
+function tabAfterPaneRemoval(tab: HTab, paneId: string, layout: Pane): HTab {
+  const next = focusPaneAfterRemoval(tab, paneId, leafIds(layout));
+  return {
+    ...tab,
+    layout,
+    focused: next.focused,
+    focusHistory: next.focusHistory,
+    maximized: tab.maximized === paneId ? undefined : tab.maximized,
+  };
+}
+
+/** Activate a tab without touching the per-tab pane focus records. */
+function withActiveHTab(node: TreeNode, tabId: string): TreeNode {
+  const next = selectHTab({ activeHTab: node.activeHTab, htabs: node.htabs }, tabId);
+  return next.activeHTab === node.activeHTab ? node : { ...node, activeHTab: next.activeHTab };
 }
 
 /** Where a pane lives, in jumpToResult coordinates. */
@@ -555,7 +810,7 @@ function makeNode(title: string, cwdFrom?: string): TreeNode {
 
 /**
  * Which pane's directory a tab "is in" — the focused leaf's own shell, or,
- * for a shell-less view (files/git/agent), the pane that leaf anchors to.
+ * for any shell-less view, the pane that leaf anchors to.
  * A tab has no cwd of its own; only its leaves' shells do.
  */
 function tabCwdSource(h: HTab): string {
@@ -571,8 +826,7 @@ function nodeCwdSource(n: TreeNode): string | undefined {
 }
 
 function initialWorkspace(title: string): Workspace {
-  const root = makeNode("page 1");
-  return { id: id(), title, roots: [root], activeNode: root.id };
+  return { id: id(), title, roots: [makeNode("page 1")] };
 }
 
 // --- immutable tree helpers ------------------------------------------------
@@ -643,6 +897,15 @@ function visibleTreeNodes(nodes: TreeNode[], out: TreeNode[] = []): TreeNode[] {
   return out;
 }
 
+/** Every page in a tree, collapsed or not — for "is any page still free?". */
+function flattenNodes(nodes: TreeNode[], out: TreeNode[] = []): TreeNode[] {
+  for (const node of nodes) {
+    out.push(node);
+    flattenNodes(node.children, out);
+  }
+  return out;
+}
+
 /** Root-to-node path, used for parent navigation and hidden-selection recovery. */
 function findNodePath(
   nodes: TreeNode[],
@@ -658,25 +921,27 @@ function findNodePath(
   return undefined;
 }
 
-function selectAdjacentVisibleNode(ws: Workspace, offset: -1 | 1): Workspace {
+/** The page `offset` steps away in the visible tree, or undefined at the end. */
+function adjacentVisibleNodeId(
+  ws: Workspace,
+  currentId: string,
+  offset: -1 | 1
+): string | undefined {
   const visible = visibleTreeNodes(ws.roots);
-  const index = visible.findIndex((node) => node.id === ws.activeNode);
+  const index = visible.findIndex((node) => node.id === currentId);
 
   // Collapse-all or a mouse collapse can leave the active page hidden. Bring
   // selection back to its nearest visible ancestor before moving any farther.
   if (index < 0) {
-    const path = findNodePath(ws.roots, ws.activeNode);
-    if (!path) return ws;
+    const path = findNodePath(ws.roots, currentId);
+    if (!path) return undefined;
     for (let i = path.length - 1; i >= 0; i--) {
-      if (visible.some((node) => node.id === path[i].id)) {
-        return { ...ws, activeNode: path[i].id };
-      }
+      if (visible.some((node) => node.id === path[i].id)) return path[i].id;
     }
-    return ws;
+    return undefined;
   }
 
-  const target = visible[index + offset];
-  return target ? { ...ws, activeNode: target.id } : ws;
+  return visible[index + offset]?.id;
 }
 
 /** Expand every ancestor of `nodeId` (not the node itself) so it's visible in the tree. */
@@ -698,11 +963,70 @@ function subtreeLeafIds(node: TreeNode): string[] {
 
 // --- store -----------------------------------------------------------------
 
+// This workspace is only a safe pre-hydration fallback. In the desktop app the
+// persisted workspace collection replaces it before React's first render.
 const first = initialWorkspace("ws 1");
+
+/** Map one workspace by id; pass others through untouched. */
+function inWs(
+  workspaces: Workspace[],
+  workspaceId: string,
+  fn: (ws: Workspace) => Workspace
+): Workspace[] {
+  return workspaces.map((ws) => (ws.id === workspaceId ? fn(ws) : ws));
+}
 
 /** Map only the active workspace; pass others through untouched. */
 function inActiveWs(s: State, fn: (ws: Workspace) => Workspace): Workspace[] {
-  return s.workspaces.map((ws) => (ws.id === s.activeWorkspace ? fn(ws) : ws));
+  return inWs(s.workspaces, s.activeWorkspace, fn);
+}
+
+/**
+ * The page THIS window is on. Everything that acts on "the current page" reads
+ * it from here rather than from the workspace record, which is shared with the
+ * other windows — that's what lets two monitors sit on different pages of one
+ * project. Falls back to the first page for a workspace this window has not
+ * opened before.
+ */
+function activeNodeId(s: State): string {
+  const stored = s.activeNodes[s.activeWorkspace];
+  if (stored) return stored;
+  const ws = s.workspaces.find((w) => w.id === s.activeWorkspace);
+  return ws?.roots[0]?.id ?? "";
+}
+
+/** Keyboard tree navigation: one visible page up or down, ownership respected. */
+function stepToVisibleNode(s: State, offset: -1 | 1): Pick<State, "activeNodes"> | null {
+  const ws = s.workspaces.find((w) => w.id === s.activeWorkspace);
+  if (!ws) return null;
+  const next = adjacentVisibleNodeId(ws, activeNodeId(s), offset);
+  return next ? goToPage(s, next) : null;
+}
+
+/** State patch for "this window now shows `nodeId`". */
+function showPage(s: State, nodeId: string): Pick<State, "activeNodes"> {
+  return { activeNodes: { ...s.activeNodes, [s.activeWorkspace]: nodeId } };
+}
+
+/**
+ * Move this window to `nodeId` unless another window is already showing it —
+ * then raise that window and stay put. Pages are exclusive because they own
+ * live terminals: the PTY server keeps one socket per pane and closes the
+ * previous on reattach, so two windows on one page would fight over every
+ * shell in it. Newly created pages skip the check — nobody else can have them.
+ */
+function goToPage(
+  s: State,
+  nodeId: string,
+  opts?: { fresh?: true }
+): Pick<State, "activeNodes"> | null {
+  if (!nodeId || nodeId === activeNodeId(s)) return null;
+  if (!opts?.fresh && s.takenPages.has(nodeId)) {
+    void claimPage(nodeId); // raises the window that holds it
+    return null;
+  }
+  void claimPage(nodeId);
+  return showPage(s, nodeId);
 }
 
 /** Update a leaf by globally unique id even if its tab was backgrounded while
@@ -727,17 +1051,67 @@ function updateLeafEverywhere(
   return workspaces.map((workspace) => ({ ...workspace, roots: updateNodes(workspace.roots) }));
 }
 
-/** Close one leaf in the active tab; drops the whole tab if it was the last pane. */
+/** Apply one of AgentPane's leaf mutations to a first-class conversation while
+ * preserving the timestamps used by the conversation list. */
+function updateAgentConversation(
+  conversations: AgentConversation[],
+  leafId: string,
+  fn: (leaf: AgentConversation) => Pane & { kind: "leaf" }
+): AgentConversation[] {
+  return conversations.map((conversation) =>
+    conversation.id === leafId
+      ? { ...conversation, ...fn(conversation), updatedAt: Date.now() }
+      : conversation
+  );
+}
+
+/**
+ * Locate the workspace / page / tab a leaf lives in. Leaf ids are globally
+ * unique (same assumption updateLeafEverywhere leans on), so the first hit is
+ * the only hit.
+ */
+function findLeafHome(
+  workspaces: Workspace[],
+  leafId: string
+): { workspaceId: string; nodeId: string; htab: HTab } | undefined {
+  const search = (
+    nodes: TreeNode[],
+    workspaceId: string
+  ): { workspaceId: string; nodeId: string; htab: HTab } | undefined => {
+    for (const node of nodes) {
+      const htab = node.htabs.find((h) => leafIds(h.layout).includes(leafId));
+      if (htab) return { workspaceId, nodeId: node.id, htab };
+      const hit = search(node.children, workspaceId);
+      if (hit) return hit;
+    }
+    return undefined;
+  };
+  for (const ws of workspaces) {
+    const hit = search(ws.roots, ws.id);
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
+/**
+ * Close one leaf; drops the whole tab if it was the last pane.
+ *
+ * Resolves the leaf's own tab rather than assuming the active one — a pane can
+ * now close itself when its shell exits (see terminal/shellExit.ts), and that
+ * can land on a backgrounded tab or a workspace the user has since switched
+ * away from. Passing a leaf from the active tab, as every UI path does, behaves
+ * exactly as before.
+ */
 function closeLeaf(s: State, leafId: string): Partial<State> {
-  const node = activeNode(s);
-  const htab = node?.htabs.find((h) => h.id === node.activeHTab);
-  if (!node || !htab) return {};
+  const home = findLeafHome(s.workspaces, leafId);
+  if (!home) return {};
+  const { workspaceId, nodeId, htab } = home;
   disposePaneSessions(leafId);
   const layout = removeLeaf(htab.layout, leafId);
   return {
-    workspaces: inActiveWs(s, (ws) => ({
+    workspaces: inWs(s.workspaces, workspaceId, (ws) => ({
       ...ws,
-      roots: updateNode(ws.roots, ws.activeNode, (n) => {
+      roots: updateNode(ws.roots, nodeId, (n) => {
         if (layout === null) {
           const htabs = n.htabs.filter((h) => h.id !== htab.id);
           if (htabs.length === 0) {
@@ -751,12 +1125,7 @@ function closeLeaf(s: State, leafId: string): Partial<State> {
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== htab.id) return h;
-            return {
-              ...h,
-              layout,
-              focused: h.focused === leafId ? firstLeaf(layout) : h.focused,
-              maximized: h.maximized === leafId ? undefined : h.maximized,
-            };
+            return tabAfterPaneRemoval(h, leafId, layout);
           }),
         };
       }),
@@ -764,8 +1133,13 @@ function closeLeaf(s: State, leafId: string): Partial<State> {
   };
 }
 
-export const useStore = create<State>((set) => ({
+export const useStore = create<State>((set, get) => ({
   workspaces: [first],
+  agentConversations: [],
+  userProfile: { nickname: "" },
+  setUserProfile: (patch) => set((state) => ({
+    userProfile: { ...state.userProfile, ...patch },
+  })),
   activeWorkspace: first.id,
 
   theme: loadThemeId(),
@@ -788,11 +1162,37 @@ export const useStore = create<State>((set) => ({
       return { theme: prev.id };
     }),
 
-  sidebarCollapsed: false,
-  toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
+  // Chrome, not data: each window keeps its own sidebar open or shut, so
+  // hiding it in one doesn't reach across and hide it in the others. sync.ts
+  // seeds it from the old shared value the first time a window runs.
+  sidebarCollapsed: readWindowPref("sidebarCollapsed") === "1",
+  toggleSidebar: () =>
+    set((s) => {
+      const sidebarCollapsed = !s.sidebarCollapsed;
+      writeWindowPref("sidebarCollapsed", sidebarCollapsed ? "1" : "0");
+      return { sidebarCollapsed };
+    }),
 
   railCollapsed: false,
   toggleRail: () => set((s) => ({ railCollapsed: !s.railCollapsed })),
+
+  botEnabled: (() => {
+    try { return localStorage.getItem("termany.bot-enabled") !== "false"; }
+    catch { return true; }
+  })(),
+  setBotEnabled: (botEnabled) => {
+    try { localStorage.setItem("termany.bot-enabled", String(botEnabled)); }
+    catch { /* The in-memory preference still works when storage is blocked. */ }
+    set({ botEnabled });
+  },
+
+  railVisibility: loadRailVisibility(),
+  setRailItemVisible: (id, visible) =>
+    set((s) => {
+      const railVisibility = { ...s.railVisibility, [id]: visible };
+      saveRailVisibility(railVisibility);
+      return { railVisibility };
+    }),
 
   updateVersion: null,
   setUpdateVersion: (v) => set({ updateVersion: v }),
@@ -811,27 +1211,365 @@ export const useStore = create<State>((set) => ({
       return { keybindings: next };
     }),
 
-  addWorkspace: (init) =>
+  activeNodes: {},
+  takenPages: new Set<string>(),
+  setTakenPages: (taken) => set({ takenPages: taken }),
+
+  addAgentConversation: (runtimeId, title) => {
+    const conversation = makeAgentConversation(runtimeId, get().activeWorkspace, title);
+    set((s) => ({ agentConversations: [conversation, ...s.agentConversations] }));
+    return conversation.id;
+  },
+
+  deliverAgentPrivateMessages: (groupId, messages) => set((state) => ({
+    agentConversations: deliverPrivateMessages(state.agentConversations, groupId, messages),
+  })),
+
+  deliverAgentA2AReply: (recipientId, message) => set((state) => ({
+    agentConversations: deliverA2AReply(state.agentConversations, recipientId, message),
+  })),
+
+  markAgentConversationRead: (id) => set((state) => ({
+    agentConversations: state.agentConversations.map((conversation) => {
+      if (conversation.id !== id) return conversation;
+      const last = Math.max(conversation.agentReadAt ?? 0, ...allAgentConversationMessages(conversation)
+        .filter((message) => message.role === "assistant").map((message) => message.createdAt));
+      if (!conversation.agentUnread && last <= (conversation.agentReadAt ?? 0)) return conversation;
+      return { ...conversation, agentUnread: 0, agentReadAt: last };
+    }),
+  })),
+
+  addAgentGroup: (title, memberIds, workspaceId) => {
+    const state = get();
+    const ids = groupMemberIds(memberIds, state.agentConversations, workspaceId, state.workspaces[0]?.id ?? "");
+    if (!title.trim() || ids.length < 2 || !state.workspaces.some((workspace) => workspace.id === workspaceId)) return null;
+    const topicId = id();
+    const now = Date.now();
+    const conversation = {
+      ...makeAgentConversation(undefined, workspaceId, title.trim()),
+      agentTopics: undefined,
+      agentActiveTopicId: undefined,
+      agentGroup: {
+        memberIds: ids,
+        leadMemberId: ids[0],
+        topics: [{ id: topicId, title: "", createdAt: now, updatedAt: now }],
+        activeTopicId: topicId,
+      },
+    };
+    set((s) => ({ agentConversations: [conversation, ...s.agentConversations] }));
+    return conversation.id;
+  },
+
+  setAgentGroupMembers: (id, memberIds) => {
+    const state = get();
+    const group = state.agentConversations.find((conversation) => conversation.id === id);
+    if (!group?.agentGroup) return;
+    const firstWorkspaceId = state.workspaces[0]?.id ?? "";
+    const ids = groupMemberIds(memberIds, state.agentConversations, group.workspaceId ?? firstWorkspaceId, firstWorkspaceId);
+    if (ids.length < 2) return;
+    const leadMemberId = group.agentGroup.leadMemberId && ids.includes(group.agentGroup.leadMemberId)
+      ? group.agentGroup.leadMemberId
+      : ids[0];
+    if (leadMemberId !== group.agentGroup.leadMemberId) {
+      const topics = group.agentGroup.topics?.length ? group.agentGroup.topics : [undefined];
+      for (const topic of topics) disposePaneSessions(groupControllerSessionId(id, topic?.id));
+    }
+    for (const memberId of group.agentGroup.memberIds) {
+      if (ids.includes(memberId)) continue;
+      const topics = group.agentGroup.topics?.length ? group.agentGroup.topics : [undefined];
+      for (const topic of topics) disposePaneSessions(groupMemberSessionId(id, memberId, topic?.id));
+    }
+    set((s) => ({ agentConversations: s.agentConversations.map((conversation) =>
+      conversation.id === id ? {
+        ...conversation,
+        agentGroup: { ...conversation.agentGroup, memberIds: ids, leadMemberId },
+        updatedAt: Date.now(),
+      } : conversation
+    ) }));
+  },
+
+  setAgentGroupLeadMember: (id, memberId) => {
+    const group = get().agentConversations.find((conversation) => conversation.id === id);
+    if (!group?.agentGroup || !group.agentGroup.memberIds.includes(memberId) || group.agentGroup.leadMemberId === memberId) return;
+    const topics = group.agentGroup.topics?.length ? group.agentGroup.topics : [undefined];
+    for (const topic of topics) disposePaneSessions(groupControllerSessionId(id, topic?.id));
+    set((state) => ({ agentConversations: state.agentConversations.map((conversation) =>
+      conversation.id === id && conversation.agentGroup ? {
+        ...conversation,
+        agentGroup: { ...conversation.agentGroup, leadMemberId: memberId },
+        updatedAt: Date.now(),
+      } : conversation
+    ) }));
+  },
+
+  addAgentTopic: (conversationId) => {
+    const current = get().agentConversations.find((conversation) => conversation.id === conversationId);
+    if (!current) return null;
+    const topicId = id();
+    const now = Date.now();
+    const topics = agentConversationTopics(current);
+    set((state) => ({
+      agentConversations: state.agentConversations.map((conversation) => conversation.id === conversationId
+        ? withAgentTopics(conversation, [...topics, { id: topicId, title: "", createdAt: now, updatedAt: now }], topicId)
+        : conversation),
+    }));
+    return topicId;
+  },
+
+  setActiveAgentTopic: (conversationId, topicId) => set((state) => ({
+    agentConversations: state.agentConversations.map((conversation) => {
+      if (conversation.id !== conversationId) return conversation;
+      const topics = agentConversationTopics(conversation);
+      if (!topics.some((topic) => topic.id === topicId)) return conversation;
+      return withAgentTopics(conversation, topics, topicId);
+    }),
+  })),
+
+  renameAgentTopic: (conversationId, topicId, title) => {
+    const nextTitle = title.trim();
+    if (!nextTitle) return;
+    set((state) => ({
+      agentConversations: state.agentConversations.map((conversation) => {
+        if (conversation.id !== conversationId) return conversation;
+        const topics = agentConversationTopics(conversation);
+        if (!topics.some((topic) => topic.id === topicId)) return conversation;
+        const activeTopicId = conversation.agentGroup?.activeTopicId ?? conversation.agentActiveTopicId;
+        return withAgentTopics(
+          conversation,
+          topics.map((topic) => topic.id === topicId ? { ...topic, title: nextTitle } : topic),
+          activeTopicId
+        );
+      }),
+    }));
+  },
+
+  deleteAgentTopic: (conversationId, topicId) => {
+    const current = get().agentConversations.find((conversation) => conversation.id === conversationId);
+    if (!current) return;
+    const topics = agentConversationTopics(current);
+    if (topics.length <= 1 || !topics.some((topic) => topic.id === topicId)) return;
+    if (current.agentGroup) {
+      disposePaneSessions(groupControllerSessionId(conversationId, topicId));
+      current.agentGroup.memberIds.forEach((memberId) =>
+        disposePaneSessions(groupMemberSessionId(conversationId, memberId, topicId))
+      );
+    } else {
+      disposePaneSessions(agentConversationTopicSessionId(conversationId, topicId));
+      get().agentConversations.forEach((conversation) => {
+        if (conversation.id !== conversationId && !conversation.agentGroup) {
+          disposePaneSessions(directA2ASessionId(conversationId, conversation.id, topicId));
+        }
+      });
+    }
+    set((state) => ({
+      agentConversations: state.agentConversations.map((conversation) => {
+        if (conversation.id !== conversationId) return conversation;
+        const remaining = agentConversationTopics(conversation).filter((topic) => topic.id !== topicId);
+        if (remaining.length === 0) return conversation;
+        const previousActiveTopicId = conversation.agentGroup?.activeTopicId ?? conversation.agentActiveTopicId;
+        const activeTopicId = previousActiveTopicId === topicId
+          ? [...remaining].sort((a, b) => b.updatedAt - a.updatedAt)[0].id
+          : previousActiveTopicId;
+        return withAgentTopics(conversation, remaining, activeTopicId);
+      }),
+    }));
+  },
+
+  setAgentTopicMessages: (conversationId, topicId, messages) => set((state) => ({
+    agentConversations: state.agentConversations.map((conversation) => {
+      if (conversation.id !== conversationId) return conversation;
+      const topics = agentConversationTopics(conversation);
+      const previous = topics.find((topic) => topic.id === topicId);
+      if (!previous) return conversation;
+      const storedIds = new Set((previous.agentMessages ?? []).map((message) => message.id));
+      const next = messages.slice(-MAX_PERSISTED_AGENT_MESSAGES)
+        .map((message) => ({ ...message, content: message.content.slice(0, 12_000) }));
+      const added = next.filter((message) => message.role === "assistant" && !storedIds.has(message.id)).length;
+      const updatedAt = next.reduce((latest, message) => Math.max(latest, message.createdAt), previous.updatedAt);
+      const nextConversation = {
+        ...conversation,
+        updatedAt,
+        agentUnread: (conversation.agentUnread ?? unreadAgentMessages(conversation)) + added,
+      };
+      return withAgentTopics(
+        nextConversation,
+        topics.map((topic) => topic.id === topicId ? {
+          ...topic,
+          title: topic.title || groupTopicTitle(next),
+          updatedAt,
+          agentMessages: next,
+        } : topic),
+        conversation.agentGroup?.activeTopicId ?? conversation.agentActiveTopicId ?? topicId
+      );
+    }),
+  })),
+
+  deleteAgentConversation: (conversationId) => {
+    const result = removeAgentConversation(get().agentConversations, conversationId);
+    if (result.sessionIds.length === 0) return;
+    result.sessionIds.forEach(disposePaneSessions);
+    set({ agentConversations: result.conversations });
+  },
+
+  setAgentConversationMeta: (conversationId, patch) =>
+    set((s) => ({
+      agentConversations: s.agentConversations.map((conversation) =>
+        conversation.id === conversationId
+          ? { ...conversation, ...patch, updatedAt: Date.now() }
+          : conversation
+      ),
+    })),
+
+  addAgentConversationFolder: (workspaceId, title, beforeFolderId) => {
+    const folderId = id();
+    set((state) => ({
+      workspaces: inWs(state.workspaces, workspaceId, (workspace) => {
+        const folders = workspace.agentConversationFolders ?? [];
+        const beforeIndex = beforeFolderId
+          ? folders.findIndex((folder) => folder.id === beforeFolderId)
+          : -1;
+        const index = beforeIndex < 0 ? folders.length : beforeIndex;
+        const folder = {
+          id: folderId,
+          title: title.trim(),
+          createdAt: Date.now(),
+        };
+        return {
+          ...workspace,
+          agentConversationFolders: [...folders.slice(0, index), folder, ...folders.slice(index)],
+        };
+      }),
+    }));
+    return folderId;
+  },
+
+  renameAgentConversationFolder: (workspaceId, folderId, title) => set((state) => ({
+    workspaces: inWs(state.workspaces, workspaceId, (workspace) => ({
+      ...workspace,
+      agentConversationFolders: (workspace.agentConversationFolders ?? []).map((folder) =>
+        folder.id === folderId ? { ...folder, title: title.trim() } : folder
+      ),
+    })),
+  })),
+
+  moveAgentConversationFolder: (workspaceId, folderId, direction) => set((state) => ({
+    workspaces: inWs(state.workspaces, workspaceId, (workspace) => {
+      const folders = workspace.agentConversationFolders ?? [];
+      const index = folders.findIndex((folder) => folder.id === folderId);
+      const targetIndex = index + direction;
+      if (index < 0 || targetIndex < 0 || targetIndex >= folders.length) return workspace;
+      const reordered = [...folders];
+      [reordered[index], reordered[targetIndex]] = [reordered[targetIndex], reordered[index]];
+      return { ...workspace, agentConversationFolders: reordered };
+    }),
+  })),
+
+  deleteAgentConversationFolder: (workspaceId, folderId) => set((state) => {
+    const firstWorkspaceId = state.workspaces[0]?.id ?? "";
+    return {
+      workspaces: inWs(state.workspaces, workspaceId, (workspace) => ({
+        ...workspace,
+        agentConversationFolders: (workspace.agentConversationFolders ?? []).filter((folder) => folder.id !== folderId),
+      })),
+      agentConversations: state.agentConversations.map((conversation) =>
+        (conversation.workspaceId ?? firstWorkspaceId) === workspaceId && conversation.agentFolderId === folderId
+          ? { ...conversation, agentFolderId: undefined, agentSortOrder: undefined }
+          : conversation
+      ),
+    };
+  }),
+
+  setAgentUngroupedTitle: (workspaceId, title) => set((state) => ({
+    workspaces: inWs(state.workspaces, workspaceId, (workspace) => ({
+      ...workspace,
+      agentUngroupedTitle: title.trim(),
+    })),
+  })),
+
+  setAgentUngroupedCollapsed: (workspaceId, collapsed) => set((state) => ({
+    workspaces: inWs(state.workspaces, workspaceId, (workspace) => ({
+      ...workspace,
+      agentUngroupedCollapsed: collapsed,
+    })),
+  })),
+
+  setAgentConversationFolderCollapsed: (workspaceId, folderId, collapsed) => set((state) => ({
+    workspaces: inWs(state.workspaces, workspaceId, (workspace) => ({
+      ...workspace,
+      agentConversationFolders: (workspace.agentConversationFolders ?? []).map((folder) =>
+        folder.id === folderId ? { ...folder, collapsed } : folder
+      ),
+    })),
+  })),
+
+  setAgentConversationPinned: (conversationId, pinned) => set((state) => ({
+    agentConversations: state.agentConversations.map((conversation) =>
+      conversation.id === conversationId ? { ...conversation, agentPinned: pinned } : conversation
+    ),
+  })),
+
+  organizeAgentConversations: (updates) => set((state) => {
+    const byId = new Map(updates.map((update) => [update.id, update]));
+    return {
+      agentConversations: state.agentConversations.map((conversation) => {
+        const update = byId.get(conversation.id);
+        return update ? { ...conversation, ...update } : conversation;
+      }),
+    };
+  }),
+
+  addWorkspace: (init) => {
+    const ws = initialWorkspace(init?.title?.trim() || `ws ${get().workspaces.length + 1}`);
+    if (init?.icon) ws.icon = init.icon;
+    set((s) => ({
+      workspaces: [...s.workspaces, ws],
+      activeWorkspace: ws.id,
+      // Brand new, so nobody else can be on its page — claim it outright.
+      activeNodes: { ...s.activeNodes, [ws.id]: ws.roots[0].id },
+    }));
+    void claimPage(ws.roots[0].id);
+  },
+
+  /**
+   * Workspaces are shared, not owned: any number of windows can sit in the same
+   * one, which is the whole point of spreading a project across monitors. What
+   * can't overlap is the PAGE each window shows — so this also settles which
+   * page of `wsId` this window lands on. Safe to call for the workspace already
+   * active; that's how a window claims its first page at startup.
+   */
+  setActiveWorkspace: (wsId) =>
     set((s) => {
-      const ws = initialWorkspace(init?.title?.trim() || `ws ${s.workspaces.length + 1}`);
-      if (init?.icon) ws.icon = init.icon;
-      return { workspaces: [...s.workspaces, ws], activeWorkspace: ws.id };
+      const ws = s.workspaces.find((w) => w.id === wsId);
+      if (!ws) return s;
+      const pages = flattenNodes(ws.roots);
+      const settled = s.activeNodes[wsId];
+      const keep =
+        settled && pages.some((n) => n.id === settled) && !s.takenPages.has(settled)
+          ? settled
+          : undefined;
+      const landing = keep ?? pages.find((n) => !s.takenPages.has(n.id))?.id;
+
+      if (landing) {
+        if (wsId === s.activeWorkspace && landing === settled) return s;
+        void claimPage(landing);
+        return { activeWorkspace: wsId, activeNodes: { ...s.activeNodes, [wsId]: landing } };
+      }
+
+      // Every page is already on screen in another window. Open a fresh one
+      // rather than doubling up on shells somebody else is working in.
+      const page = makeNode(`page ${pages.length + 1}`);
+      void claimPage(page.id);
+      return {
+        activeWorkspace: wsId,
+        workspaces: s.workspaces.map((w) =>
+          w.id === wsId ? { ...w, roots: [...w.roots, page] } : w
+        ),
+        activeNodes: { ...s.activeNodes, [wsId]: page.id },
+      };
     }),
 
-  setActiveWorkspace: (wsId) => set({ activeWorkspace: wsId }),
-
-  nextWorkspace: () =>
-    set((s) => {
-      const i = s.workspaces.findIndex((w) => w.id === s.activeWorkspace);
-      return { activeWorkspace: s.workspaces[(i + 1) % s.workspaces.length].id };
-    }),
-
-  prevWorkspace: () =>
-    set((s) => {
-      const len = s.workspaces.length;
-      const i = s.workspaces.findIndex((w) => w.id === s.activeWorkspace);
-      return { activeWorkspace: s.workspaces[(i - 1 + len) % len].id };
-    }),
+  nextWorkspace: () => get().setActiveWorkspace(stepWorkspace(get(), 1)),
+  prevWorkspace: () => get().setActiveWorkspace(stepWorkspace(get(), -1)),
 
   renameWorkspace: (wsId, title) =>
     set((s) => ({
@@ -843,37 +1581,56 @@ export const useStore = create<State>((set) => ({
       workspaces: s.workspaces.map((w) => (w.id === wsId ? { ...w, icon: icon ?? undefined } : w)),
     })),
 
-  deleteWorkspace: (wsId) =>
-    set((s) => {
-      if (s.workspaces.length <= 1) return s;
-      const target = s.workspaces.find((w) => w.id === wsId);
-      if (!target) return s;
-      target.roots.flatMap(subtreeLeafIds).forEach(disposePaneSessions);
-      const workspaces = s.workspaces.filter((w) => w.id !== wsId);
-      const activeWorkspace =
-        s.activeWorkspace === wsId ? workspaces[0].id : s.activeWorkspace;
-      return { workspaces, activeWorkspace };
-    }),
+  deleteWorkspace: (wsId) => {
+    const s = get();
+    if (s.workspaces.length <= 1) return;
+    const target = s.workspaces.find((w) => w.id === wsId);
+    if (!target) return;
+    // Deleting disposes every shell in the workspace, and another window may be
+    // working in one of its pages. That's not ours to close — the UI hides the
+    // button while any page of it is on screen elsewhere.
+    if (flattenNodes(target.roots).some((n) => s.takenPages.has(n.id))) return;
+    target.roots.flatMap(subtreeLeafIds).forEach(disposePaneSessions);
+    const workspaces = s.workspaces.filter((w) => w.id !== wsId);
+    set({
+      workspaces,
+      agentConversations: s.agentConversations.filter(
+        (conversation) => (conversation.workspaceId ?? s.workspaces[0]?.id) !== wsId
+      ),
+    });
+    // setActiveWorkspace settles which page of the survivor this window lands
+    // on, skipping whatever the other windows hold.
+    if (s.activeWorkspace === wsId) get().setActiveWorkspace(workspaces[0].id);
+  },
 
   addRootNode: () =>
-    set((s) => ({
-      workspaces: inActiveWs(s, (ws) => {
-        // Lands after the last root, so that's the page it opens next to.
-        const source = ws.roots.length ? nodeCwdSource(ws.roots[ws.roots.length - 1]) : undefined;
-        const node = makeNode(`page ${ws.roots.length + 1}`, source);
-        return { ...ws, roots: [...ws.roots, node], activeNode: node.id };
-      }),
-    })),
+    set((s) => {
+      const ws = s.workspaces.find((w) => w.id === s.activeWorkspace);
+      if (!ws) return s;
+      // Lands after the last root, so that's the page it opens next to.
+      const source = ws.roots.length ? nodeCwdSource(ws.roots[ws.roots.length - 1]) : undefined;
+      const node = makeNode(`page ${ws.roots.length + 1}`, source);
+      return {
+        workspaces: inActiveWs(s, (w) => ({ ...w, roots: [...w.roots, node] })),
+        ...goToPage(s, node.id, { fresh: true }),
+      };
+    }),
 
   addChildNode: (parentId) =>
-    set((s) => ({
-      workspaces: inActiveWs(s, (ws) => {
-        // A child page opens where its parent page is.
-        const parent = findNode(ws.roots, parentId);
-        const child = makeNode("untitled", parent && nodeCwdSource(parent));
-        return { ...ws, roots: insertChild(ws.roots, parentId, child), activeNode: child.id };
-      }),
-    })),
+    set((s) => {
+      const ws = s.workspaces.find((w) => w.id === s.activeWorkspace);
+      if (!ws) return s;
+      // A child page opens where its parent page is.
+      const parent = findNode(ws.roots, parentId);
+      const child = makeNode("untitled", parent && nodeCwdSource(parent));
+      return {
+        workspaces: inActiveWs(s, (w) => ({
+          ...w,
+          roots: insertChild(w.roots, parentId, child),
+        })),
+        ...goToPage(s, child.id, { fresh: true }),
+      };
+    }),
 
   toggleExpand: (nodeId) =>
     set((s) => ({
@@ -890,54 +1647,54 @@ export const useStore = create<State>((set) => ({
       return { workspaces: inActiveWs(s, (ws) => ({ ...ws, roots: collapse(ws.roots) })) };
     }),
 
-  setActiveNode: (nodeId) =>
-    set((s) => ({ workspaces: inActiveWs(s, (ws) => ({ ...ws, activeNode: nodeId })) })),
+  setActiveNode: (nodeId) => set((s) => goToPage(s, nodeId) ?? s),
 
-  selectPreviousTreeNode: () =>
-    set((s) => ({
-      workspaces: inActiveWs(s, (ws) => selectAdjacentVisibleNode(ws, -1)),
-    })),
-
-  selectNextTreeNode: () =>
-    set((s) => ({
-      workspaces: inActiveWs(s, (ws) => selectAdjacentVisibleNode(ws, 1)),
-    })),
+  selectPreviousTreeNode: () => set((s) => stepToVisibleNode(s, -1) ?? s),
+  selectNextTreeNode: () => set((s) => stepToVisibleNode(s, 1) ?? s),
 
   expandOrEnterTreeNode: () =>
-    set((s) => ({
-      workspaces: inActiveWs(s, (ws) => {
-        const node = findNode(ws.roots, ws.activeNode);
-        if (!node?.children.length) return ws;
-        if (!node.expanded) {
-          return {
-            ...ws,
-            roots: updateNode(ws.roots, node.id, (n) => ({ ...n, expanded: true })),
-          };
-        }
-        return { ...ws, activeNode: node.children[0].id };
-      }),
-    })),
+    set((s) => {
+      const ws = s.workspaces.find((w) => w.id === s.activeWorkspace);
+      const node = ws && findNode(ws.roots, activeNodeId(s));
+      if (!ws || !node?.children.length) return s;
+      if (!node.expanded) {
+        return {
+          workspaces: inActiveWs(s, (w) => ({
+            ...w,
+            roots: updateNode(w.roots, node.id, (n) => ({ ...n, expanded: true })),
+          })),
+        };
+      }
+      return goToPage(s, node.children[0].id) ?? s;
+    }),
 
   collapseOrExitTreeNode: () =>
-    set((s) => ({
-      workspaces: inActiveWs(s, (ws) => {
-        const path = findNodePath(ws.roots, ws.activeNode);
-        const node = path?.[path.length - 1];
-        if (!node) return ws;
-        if (node.children.length && node.expanded) {
-          return {
-            ...ws,
-            roots: updateNode(ws.roots, node.id, (n) => ({ ...n, expanded: false })),
-          };
-        }
-        const parent = path?.[path.length - 2];
-        return parent ? { ...ws, activeNode: parent.id } : ws;
-      }),
-    })),
+    set((s) => {
+      const ws = s.workspaces.find((w) => w.id === s.activeWorkspace);
+      const path = ws && findNodePath(ws.roots, activeNodeId(s));
+      const node = path?.[path.length - 1];
+      if (!ws || !node) return s;
+      if (node.children.length && node.expanded) {
+        return {
+          workspaces: inActiveWs(s, (w) => ({
+            ...w,
+            roots: updateNode(w.roots, node.id, (n) => ({ ...n, expanded: false })),
+          })),
+        };
+      }
+      const parent = path?.[path.length - 2];
+      return (parent && goToPage(s, parent.id)) ?? s;
+    }),
 
-  jumpToResult: ({ workspaceId, nodeId, tabId, paneId }) =>
+  jumpToResult: ({ workspaceId, nodeId, tabId, paneId }) => {
+    // The palette searches every page, including ones another window is
+    // showing. Those are that window's to display, so hand the jump over by
+    // raising it rather than pulling the page across.
+    if (get().takenPages.has(nodeId)) {
+      void claimPage(nodeId);
+      return;
+    }
     set((s) => ({
-      activeWorkspace: workspaceId,
       workspaces: s.workspaces.map((ws) => {
         if (ws.id !== workspaceId) return ws;
         let roots = expandAncestorsOf(ws.roots, nodeId);
@@ -949,15 +1706,22 @@ export const useStore = create<State>((set) => ({
               activeHTab: tabId,
               htabs: paneId
                 ? n.htabs.map((h) =>
-                    h.id === tabId ? { ...h, focused: paneId, maximized: undefined } : h
+                    h.id === tabId
+                      ? withFocusedPane({ ...h, maximized: undefined }, paneId)
+                      : h
                   )
                 : n.htabs,
             };
           });
         }
-        return { ...ws, roots, activeNode: nodeId };
+        return { ...ws, roots };
       }),
-    })),
+    }));
+    // Workspace first: the page is recorded against whichever workspace is
+    // active, so switching afterwards would file it under the old one.
+    get().setActiveWorkspace(workspaceId);
+    set((s) => goToPage(s, nodeId) ?? s);
+  },
 
   renameNode: (nodeId, title) =>
     set((s) => ({
@@ -968,17 +1732,23 @@ export const useStore = create<State>((set) => ({
     })),
 
   deleteNode: (nodeId) =>
-    set((s) => ({
-      workspaces: inActiveWs(s, (ws) => {
-        const target = findNode(ws.roots, nodeId);
-        if (!target) return ws;
-        subtreeLeafIds(target).forEach(disposePaneSessions);
-        let roots = removeNode(ws.roots, nodeId);
-        if (roots.length === 0) roots = [makeNode("page 1")];
-        const activeNode = findNode(roots, ws.activeNode) ? ws.activeNode : roots[0].id;
-        return { ...ws, roots, activeNode };
-      }),
-    })),
+    set((s) => {
+      const ws = s.workspaces.find((w) => w.id === s.activeWorkspace);
+      const target = ws && findNode(ws.roots, nodeId);
+      if (!ws || !target) return s;
+      // Deleting disposes the page's shells, which another window would be
+      // looking at. The sidebar hides the option there too.
+      if (s.takenPages.has(nodeId)) return s;
+      subtreeLeafIds(target).forEach(disposePaneSessions);
+      let roots = removeNode(ws.roots, nodeId);
+      if (roots.length === 0) roots = [makeNode("page 1")];
+      const current = activeNodeId(s);
+      const landing = findNode(roots, current) ? current : roots[0].id;
+      return {
+        workspaces: inActiveWs(s, (w) => ({ ...w, roots })),
+        ...showPage(s, landing),
+      };
+    }),
 
   moveNode: (dragId, targetId, pos = "into") =>
     set((s) => ({
@@ -1002,7 +1772,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => {
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => {
           // Follow the tab the user is coming from — which is also what the
           // page's directory means, so the no-tabs case needs no separate path.
           const h = makeHTab(n.htabs.length + 1, nodeCwdSource(n));
@@ -1015,7 +1785,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({ ...n, activeHTab: hId })),
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => withActiveHTab(n, hId)),
       })),
     })),
 
@@ -1023,7 +1793,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => (h.id === hId ? { ...h, title } : h)),
         })),
@@ -1034,7 +1804,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => {
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => {
           const target = n.htabs.find((h) => h.id === hId);
           if (target) leafIds(target.layout).forEach(disposePaneSessions);
           const htabs = n.htabs.filter((h) => h.id !== hId);
@@ -1075,56 +1845,62 @@ export const useStore = create<State>((set) => ({
             htabs: [...n.htabs, moving],
             activeHTab: moving.id,
           }));
-          return { ...ws, roots, activeNode: toNodeId };
+          return { ...ws, roots };
         }),
+        // ...unless another window is showing the target page — the tab (and
+        // its shells) go there, which is the point of the drag, but following
+        // it would put two windows on one page.
+        ...(goToPage(s, toNodeId) ?? {}),
       };
     }),
 
   moveHTabToNewNode: (tabId, fromNodeId) =>
-    set((s) => ({
-      workspaces: inActiveWs(s, (ws) => {
-        const from = findNode(ws.roots, fromNodeId);
-        const moving = from?.htabs.find((h) => h.id === tabId);
-        if (!moving) return ws;
-        const roots = updateNode(ws.roots, fromNodeId, (n) => {
-          const htabs = n.htabs.filter((h) => h.id !== tabId);
-          if (htabs.length === 0) {
-            const h = makeHTab(1);
-            return { ...n, htabs: [h], activeHTab: h.id };
-          }
-          return {
-            ...n,
-            htabs,
-            activeHTab: n.activeHTab === tabId ? htabs[htabs.length - 1].id : n.activeHTab,
-          };
-        });
-        const created: TreeNode = {
-          id: id(),
-          title: moving.title,
-          expanded: true,
-          children: [],
-          htabs: [moving],
-          activeHTab: moving.id,
+    set((s) => {
+      const ws = s.workspaces.find((w) => w.id === s.activeWorkspace);
+      const from = ws && findNode(ws.roots, fromNodeId);
+      const moving = from?.htabs.find((h) => h.id === tabId);
+      if (!ws || !moving) return s;
+      const roots = updateNode(ws.roots, fromNodeId, (n) => {
+        const htabs = n.htabs.filter((h) => h.id !== tabId);
+        if (htabs.length === 0) {
+          const h = makeHTab(1);
+          return { ...n, htabs: [h], activeHTab: h.id };
+        }
+        return {
+          ...n,
+          htabs,
+          activeHTab: n.activeHTab === tabId ? htabs[htabs.length - 1].id : n.activeHTab,
         };
-        return { ...ws, roots: [...roots, created], activeNode: created.id };
-      }),
-    })),
+      });
+      const created: TreeNode = {
+        id: id(),
+        title: moving.title,
+        expanded: true,
+        children: [],
+        htabs: [moving],
+        activeHTab: moving.id,
+      };
+      return {
+        workspaces: inActiveWs(s, (w) => ({ ...w, roots: [...roots, created] })),
+        ...goToPage(s, created.id, { fresh: true }),
+      };
+    }),
 
   splitFocused: (dir) =>
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== n.activeHTab || paneCount(h.layout) >= MAX_PANES_PER_TAB) return h;
             const leaf = makeLeaf(nextPaneTitle(h.layout), h.focused);
-            return {
+            const next = {
               ...h,
               layout: splitPane(h.layout, h.focused, dir, leaf),
-              focused: leaf.id,
               maximized: undefined,
             };
+            return withFocusedPane(next, leaf.id);
           }),
         })),
       })),
@@ -1139,24 +1915,30 @@ export const useStore = create<State>((set) => ({
   closePane: (leafId) => set((s) => closeLeaf(s, leafId)),
 
   setFocusedPane: (leafId) =>
-    set((s) => ({
-      workspaces: inActiveWs(s, (ws) => ({
-        ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
-          ...n,
-          htabs: n.htabs.map((h) => (h.id === n.activeHTab ? { ...h, focused: leafId } : h)),
+    set((s) => {
+      const active = activeHtab(s);
+      if (!active || active.focused === leafId || !findLeaf(active.layout, leafId)) return s;
+      return {
+        workspaces: inActiveWs(s, (ws) => ({
+          ...ws,
+          roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
+            ...n,
+            htabs: n.htabs.map((h) =>
+              h.id === n.activeHTab ? withFocusedPane(h, leafId) : h
+            ),
+          })),
         })),
-      })),
-    })),
+      };
+    }),
 
   nextHTab: () =>
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => {
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => {
           if (n.htabs.length < 2) return n;
           const i = n.htabs.findIndex((h) => h.id === n.activeHTab);
-          return { ...n, activeHTab: n.htabs[(i + 1) % n.htabs.length].id };
+          return withActiveHTab(n, n.htabs[(i + 1) % n.htabs.length].id);
         }),
       })),
     })),
@@ -1165,10 +1947,10 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => {
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => {
           if (n.htabs.length < 2) return n;
           const i = n.htabs.findIndex((h) => h.id === n.activeHTab);
-          return { ...n, activeHTab: n.htabs[(i - 1 + n.htabs.length) % n.htabs.length].id };
+          return withActiveHTab(n, n.htabs[(i - 1 + n.htabs.length) % n.htabs.length].id);
         }),
       })),
     })),
@@ -1177,14 +1959,14 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== n.activeHTab) return h;
             const ids = leafIds(h.layout);
             if (ids.length < 2) return h;
             const i = ids.indexOf(h.focused);
-            return { ...h, focused: ids[(i + 1) % ids.length] };
+            return withFocusedPane(h, ids[(i + 1) % ids.length]);
           }),
         })),
       })),
@@ -1194,14 +1976,14 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== n.activeHTab) return h;
             const ids = leafIds(h.layout);
             if (ids.length < 2) return h;
             const i = ids.indexOf(h.focused);
-            return { ...h, focused: ids[(i - 1 + ids.length) % ids.length] };
+            return withFocusedPane(h, ids[(i - 1 + ids.length) % ids.length]);
           }),
         })),
       })),
@@ -1211,7 +1993,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== n.activeHTab) return h;
@@ -1231,7 +2013,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== n.activeHTab) return h;
@@ -1247,27 +2029,56 @@ export const useStore = create<State>((set) => ({
       })),
     })),
 
-  setAgentMessages: (leafId, messages) =>
-    set((s) => ({
-      workspaces: updateLeafEverywhere(s.workspaces, leafId, (leaf) => ({
-        ...leaf,
-        // Keep layout persistence comfortably below the 1 MB state endpoint
-        // cap. A dedicated transcript store can lift this rolling window later.
-        agentMessages: messages.slice(-24).map((item) => ({
+  setAgentMessages: (leafId, messages, removedMessageIds = []) =>
+    set((s) => {
+      const removed = new Set(removedMessageIds);
+      const nextMessages = (leaf: Pane & { kind: "leaf" }) =>
+        // Keep state persistence bounded while retaining enough history for
+        // the paginated chat view.
+        // A group can deliver a private message while this direct reply streams.
+        // Keep those independently delivered messages when saving the reply.
+        [...messages, ...(leaf.agentMessages ?? []).filter((item) =>
+          (item.sourceGroup || item.sourceBot) && !removed.has(item.id) &&
+          !messages.some((next) => next.id === item.id)
+        )].sort((a, b) => a.createdAt - b.createdAt).slice(-MAX_PERSISTED_AGENT_MESSAGES).map((item) => ({
           ...item,
           content: item.content.slice(0, 12_000),
-        })),
-      })),
-    })),
+        }));
+      const update = (leaf: Pane & { kind: "leaf" }) => ({ ...leaf, agentMessages: nextMessages(leaf) });
+      return {
+        workspaces: updateLeafEverywhere(s.workspaces, leafId, update),
+        agentConversations: updateAgentConversation(s.agentConversations, leafId, (conversation) => {
+          const storedIds = new Set((conversation.agentMessages ?? []).map((message) => message.id));
+          const next = nextMessages(conversation);
+          const added = next.filter((message) => message.role === "assistant" && !storedIds.has(message.id)).length;
+          return {
+            ...conversation,
+            agentMessages: next,
+            agentUnread: (conversation.agentUnread ?? unreadAgentMessages(conversation)) + added,
+          };
+        }),
+      };
+    }),
 
   setAgentModel: (leafId, model) =>
     set((s) => ({
       workspaces: updateLeafEverywhere(s.workspaces, leafId, (leaf) => ({ ...leaf, agentModel: model })),
+      agentConversations: updateAgentConversation(s.agentConversations, leafId, (leaf) => ({
+        ...leaf,
+        agentModel: model,
+      })),
     })),
 
   setAgentConfigOption: (leafId, agentId, configId, value) =>
     set((s) => ({
       workspaces: updateLeafEverywhere(s.workspaces, leafId, (leaf) => ({
+        ...leaf,
+        agentConfig: {
+          ...leaf.agentConfig,
+          [agentId]: { ...leaf.agentConfig?.[agentId], [configId]: value },
+        },
+      })),
+      agentConversations: updateAgentConversation(s.agentConversations, leafId, (leaf) => ({
         ...leaf,
         agentConfig: {
           ...leaf.agentConfig,
@@ -1283,11 +2094,20 @@ export const useStore = create<State>((set) => ({
         // Keep "" distinct from undefined: it records an explicit Chat choice.
         agentRuntime: runtimeId,
       })),
+      agentConversations: updateAgentConversation(s.agentConversations, leafId, (leaf) => ({
+        ...leaf,
+        agentRuntime: runtimeId,
+        ...(leaf.agentGroup ? { agentGroup: { ...leaf.agentGroup, runtimeId } } : {}),
+      })),
     })),
 
   setAgentCwd: (leafId, cwd) =>
     set((s) => ({
       workspaces: updateLeafEverywhere(s.workspaces, leafId, (leaf) => ({
+        ...leaf,
+        agentCwd: cwd || undefined,
+      })),
+      agentConversations: updateAgentConversation(s.agentConversations, leafId, (leaf) => ({
         ...leaf,
         agentCwd: cwd || undefined,
       })),
@@ -1297,31 +2117,19 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== n.activeHTab) return h;
-            // ⌘E cycles through the same order shown in the pane menu and rail.
-            const flip = (p: Pane): Pane =>
-              p.kind === "leaf"
-                ? p.id === leafId
-                  ? p.sshTarget
-                    ? { ...p, view: "terminal" }
-                    : {
-                        ...p,
-                        view:
-                          p.view === "files"
-                            ? "git"
-                            : p.view === "git"
-                              ? "agent"
-                              : p.view === "agent"
-                                ? "web"
-                                : p.view === "web"
-                                  ? "terminal"
-                                  : "files",
-                      }
-                  : p
-                : { ...p, children: p.children.map(flip) };
+            // Cmd/Ctrl+E follows the same enabled views and order as the pane
+            // menu and right rail.
+            const flip = (p: Pane): Pane => {
+              if (p.kind === "split") return { ...p, children: p.children.map(flip) };
+              if (p.id !== leafId) return p;
+              if (p.sshTarget) return { ...p, view: "terminal" };
+              const next = nextCyclablePaneView(p.view, s.railVisibility);
+              return next ? { ...p, view: next } : p;
+            };
             return { ...h, layout: flip(h.layout) };
           }),
         })),
@@ -1332,7 +2140,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== n.activeHTab) return h;
@@ -1360,7 +2168,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== n.activeHTab) return h;
@@ -1370,7 +2178,8 @@ export const useStore = create<State>((set) => ({
                   ? { ...p, view: "files", filesRoot: root, filesSelected: selectedFile }
                   : p
                 : { ...p, children: p.children.map(open) };
-            return { ...h, layout: open(h.layout), focused: leafId };
+            const layout = open(h.layout);
+            return withFocusedPane({ ...h, layout }, leafId);
           }),
         })),
       })),
@@ -1380,7 +2189,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== n.activeHTab) return h;
@@ -1401,7 +2210,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== n.activeHTab || paneCount(h.layout) >= MAX_PANES_PER_TAB) return h;
@@ -1413,12 +2222,12 @@ export const useStore = create<State>((set) => ({
               view,
             };
             created = leaf.id;
-            return {
+            const next = {
               ...h,
               layout: tileLayout(h.layout, leaf),
-              focused: leaf.id,
               maximized: undefined,
             };
+            return withFocusedPane(next, leaf.id);
           }),
         })),
       })),
@@ -1442,11 +2251,14 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) =>
             h.id === n.activeHTab
-              ? { ...h, maximized: h.maximized === leafId ? undefined : leafId, focused: leafId }
+              ? withFocusedPane(
+                  { ...h, maximized: h.maximized === leafId ? undefined : leafId },
+                  leafId,
+                )
               : h
           ),
         })),
@@ -1457,7 +2269,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== n.activeHTab || dragId === targetId) return h;
@@ -1465,12 +2277,12 @@ export const useStore = create<State>((set) => ({
             if (!dragged) return h;
             const without = removeLeaf(h.layout, dragId);
             if (!without || !findLeaf(without, targetId)) return h;
-            return {
+            const next = {
               ...h,
               layout: insertBeside(without, targetId, dragged, edge),
-              focused: dragId,
               maximized: undefined,
             };
+            return withFocusedPane(next, dragId);
           }),
         })),
       })),
@@ -1480,7 +2292,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => {
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => {
           if (n.activeHTab === targetHTabId) return n;
           const source = n.htabs.find((h) => h.id === n.activeHTab);
           const target = n.htabs.find((h) => h.id === targetHTabId);
@@ -1494,22 +2306,23 @@ export const useStore = create<State>((set) => ({
               if (h.id === source.id) {
                 if (!without) {
                   const replacement = makeLeaf();
-                  return { ...h, layout: replacement, focused: replacement.id, maximized: undefined };
+                  return {
+                    ...h,
+                    layout: replacement,
+                    focused: replacement.id,
+                    focusHistory: undefined,
+                    maximized: undefined,
+                  };
                 }
-                return {
-                  ...h,
-                  layout: without,
-                  focused: h.focused === dragId ? firstLeaf(without) : h.focused,
-                  maximized: h.maximized === dragId ? undefined : h.maximized,
-                };
+                return tabAfterPaneRemoval(h, dragId, without);
               }
               if (h.id === target.id) {
-                return {
+                const next = {
                   ...h,
                   layout: tileLayout(h.layout, dragged),
-                  focused: dragged.id,
                   maximized: undefined,
                 };
+                return withFocusedPane(next, dragged.id);
               }
               return h;
             }),
@@ -1522,7 +2335,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => {
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => {
           const source = n.htabs.find((h) => h.id === n.activeHTab);
           const dragged = source ? findLeaf(source.layout, dragId) : undefined;
           if (!source || !dragged) return n;
@@ -1539,14 +2352,7 @@ export const useStore = create<State>((set) => ({
             activeHTab: created.id,
             htabs: [
               ...n.htabs.map((h) =>
-                h.id === source.id
-                  ? {
-                      ...h,
-                      layout: without,
-                      focused: h.focused === dragId ? firstLeaf(without) : h.focused,
-                      maximized: h.maximized === dragId ? undefined : h.maximized,
-                    }
-                  : h
+                h.id === source.id ? tabAfterPaneRemoval(h, dragId, without) : h
               ),
               created,
             ],
@@ -1557,8 +2363,11 @@ export const useStore = create<State>((set) => ({
 
   movePaneToNode: (dragId, toNodeId) =>
     set((s) => ({
+      // Same as moveHTab: the pane travels, but this window only follows it if
+      // no other window is showing the destination page.
+      ...(goToPage(s, toNodeId) ?? {}),
       workspaces: inActiveWs(s, (ws) => {
-        const from = findNode(ws.roots, ws.activeNode);
+        const from = findNode(ws.roots, activeNodeId(s));
         const source = from?.htabs.find((h) => h.id === from.activeHTab);
         const dragged = source ? findLeaf(source.layout, dragId) : undefined;
         if (!from || !source || !dragged || !findNode(ws.roots, toNodeId)) return ws;
@@ -1570,16 +2379,11 @@ export const useStore = create<State>((set) => ({
           layout: dragged,
           focused: dragged.id,
         };
-        let roots = updateNode(ws.roots, ws.activeNode, (n) => ({
+        let roots = updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) =>
             h.id === source.id
-              ? {
-                  ...h,
-                  layout: without,
-                  focused: h.focused === dragId ? firstLeaf(without) : h.focused,
-                  maximized: h.maximized === dragId ? undefined : h.maximized,
-                }
+              ? tabAfterPaneRemoval(h, dragId, without)
               : h
           ),
         }));
@@ -1589,7 +2393,7 @@ export const useStore = create<State>((set) => ({
           htabs: [...n.htabs, created],
           activeHTab: created.id,
         }));
-        return { ...ws, roots, activeNode: toNodeId };
+        return { ...ws, roots };
       }),
     })),
 
@@ -1597,7 +2401,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) =>
             h.id === n.activeHTab ? { ...h, layout: setSizesAt(h.layout, path, sizes) } : h
@@ -1610,7 +2414,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== n.activeHTab) return h;
@@ -1637,7 +2441,7 @@ export const useStore = create<State>((set) => ({
     set((s) => ({
       workspaces: inActiveWs(s, (ws) => ({
         ...ws,
-        roots: updateNode(ws.roots, ws.activeNode, (n) => ({
+        roots: updateNode(ws.roots, activeNodeId(s), (n) => ({
           ...n,
           htabs: n.htabs.map((h) => {
             if (h.id !== n.activeHTab) return h;
@@ -1697,9 +2501,21 @@ export function activeWorkspace(s: State): Workspace {
   return s.workspaces.find((w) => w.id === s.activeWorkspace) ?? s.workspaces[0];
 }
 
+/**
+ * The id of the page this window is showing — its claim on the shared layout.
+ * Falls back to the first page when the stored one has been deleted by another
+ * window, so a stale claim can never leave the window rendering nothing.
+ */
+export function activePageId(s: State): string {
+  const ws = activeWorkspace(s);
+  if (!ws) return "";
+  const stored = s.activeNodes[ws.id];
+  return stored && findNode(ws.roots, stored) ? stored : (ws.roots[0]?.id ?? "");
+}
+
 export function activeNode(s: State): TreeNode | undefined {
   const ws = activeWorkspace(s);
-  return findNode(ws.roots, ws.activeNode);
+  return ws && findNode(ws.roots, activePageId(s));
 }
 
 /**
@@ -1715,6 +2531,8 @@ export function focusedCwdSession(s: State): string | undefined {
 
 /** Find a leaf by id anywhere — anchors can point across pages and workspaces. */
 function findLeafGlobal(s: State, leafId: string): (Pane & { kind: "leaf" }) | undefined {
+  const conversation = s.agentConversations.find((item) => item.id === leafId);
+  if (conversation) return conversation;
   const inNodes = (nodes: TreeNode[]): (Pane & { kind: "leaf" }) | undefined => {
     for (const n of nodes) {
       for (const h of n.htabs) {

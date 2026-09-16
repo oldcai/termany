@@ -1,5 +1,7 @@
+import { textInputProps } from "../textInputProps";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../i18n";
+import { useImeGuard } from "../imeGuard";
 import { ACTIONS, formatChord } from "../keybindings";
 import { useStore, type Pane, type TreeNode, type Workspace } from "../state/store";
 import { CommandIcon, PageIcon, SearchIcon, TerminalIcon } from "./icons";
@@ -200,10 +202,7 @@ export function SearchPalette({
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
-  // WebKit fires compositionend BEFORE the keydown that confirmed the IME
-  // text (Chrome fires it after), so on that Enter/Escape `isComposing` is
-  // already false — track the commit ourselves to swallow those keys.
-  const compositionEndedAt = useRef(0);
+  const ime = useImeGuard();
 
   const actionRows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -282,23 +281,15 @@ export function SearchPalette({
             <SearchIcon />
           </span>
           <input
+            {...textInputProps}
             className="search-input"
             autoFocus
-            autoCorrect="off"
-            autoComplete="off"
-            autoCapitalize="off"
-            spellCheck={false}
             value={query}
             placeholder={t("search.placeholder")}
             onChange={(e) => setQuery(e.target.value)}
-            onCompositionEnd={(e) => {
-              compositionEndedAt.current = e.timeStamp;
-            }}
+            {...ime.props}
             onKeyDown={(e) => {
-              // The 100ms window (same as AgentPane's composer) catches
-              // WebKit's post-compositionend keydown — same key gesture, a few
-              // ms later — without eating a genuine follow-up keypress.
-              if (e.nativeEvent.isComposing || e.timeStamp - compositionEndedAt.current < 100) return;
+              if (ime.handled(e)) return;
               if (e.key === "Escape") {
                 onClose();
               } else if (e.key === "ArrowDown") {

@@ -14,6 +14,7 @@ import {
   GearIcon,
   GitBranchIcon,
   HistoryIcon,
+  ProviderIcon,
   TerminalIcon,
   WebIcon,
 } from "./icons";
@@ -30,6 +31,14 @@ const RAIL_ITEMS: Array<{ view: PaneView; icon: () => JSX.Element }> = [
   { view: "monitor", icon: ActivityIcon },
 ];
 
+/** Dashboard shortcuts stay below the agent launcher, matching the rail's
+ * existing visual order, but use the same new-pane path as every item above. */
+const DASHBOARD_RAIL_ITEMS: Array<{ view: PaneView; icon: () => JSX.Element }> = [
+  { view: "history", icon: HistoryIcon },
+  { view: "usage", icon: ChartIcon },
+  { view: "providers", icon: ProviderIcon },
+];
+
 /**
  * Workspace-level quick-action rail, sitting beside the pane card (like the
  * left sidebar's page tree, but for panes). Not tied to any one pane — each
@@ -44,21 +53,18 @@ export function SideRail({
   onAgentsOpenChange,
   onOpenSettings,
   onOpenAgentsSettings,
-  onOpenClaudeHistory,
-  onOpenAgentUsage,
 }: {
   agentsOpen: boolean;
   onAgentsOpenChange: (open: boolean) => void;
   onOpenSettings: () => void;
   onOpenAgentsSettings: () => void;
-  onOpenClaudeHistory: () => void;
-  onOpenAgentUsage: () => void;
 }) {
   const addPane = useStore((s) => s.addPane);
   const setPaneView = useStore((s) => s.setPaneView);
   const setAgentRuntime = useStore((s) => s.setAgentRuntime);
+  const railVisibility = useStore((s) => s.railVisibility);
   const { t } = useI18n();
-  const agents = useAgentConfigs().filter((agent) => agent.enabled);
+  const agents = useAgentConfigs().filter((agent) => agent.enabled || agent.runtime);
   const agentsRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -70,6 +76,11 @@ export function SideRail({
     window.addEventListener("click", onClick);
     return () => window.removeEventListener("click", onClick);
   }, [agentsOpen, onAgentsOpenChange]);
+
+  useEffect(() => {
+    if (!railVisibility.agents && agentsOpen) onAgentsOpenChange(false);
+  }, [agentsOpen, onAgentsOpenChange, railVisibility.agents]);
+
 
   // Only blanks the web/office preview pane(s) this dropdown actually
   // overlaps, not every native webview in the workspace (see nativeViewOcclusion).
@@ -117,68 +128,66 @@ export function SideRail({
 
   return (
     <div className="side-rail">
-      {RAIL_ITEMS.map(({ view, icon: Icon }) => (
+      {RAIL_ITEMS.filter(({ view }) => railVisibility[view]).map(({ view, icon: Icon }) => (
         <button key={view} className="side-rail-btn" title={t("rail.newPane", { view: t(`pane.view.${view}`) })} onClick={() => openPane(view)}>
           <Icon />
         </button>
       ))}
-      <div className="side-rail-agent" ref={agentsRef}>
-        <button
-          className={`side-rail-btn ${agentsOpen ? "active" : ""}`}
-          title={t("rail.runAgent")}
-          onClick={() => onAgentsOpenChange(!agentsOpen)}
-        >
-          <AgentIcon />
-        </button>
-        {agentsOpen && (
-          <div className="agent-menu" ref={menuRef}>
-            {agents.map((agent) => (
-              <div key={agent.id} className="agent-menu-entry">
-                <button className="agent-menu-item" onClick={() => openAgent(agent)}>
-                  {agent.icon ? (
-                    <img className="agent-menu-icon" src={agent.icon} alt="" aria-hidden="true" />
-                  ) : (
-                    <span className="agent-menu-icon fallback">
-                      <AgentIcon />
-                    </span>
-                  )}
-                  <span>{agent.name}</span>
-                  {agent.runtime && <ChatIcon />}
-                </button>
-                {agent.runtime && (
-                  <button
-                    className="agent-menu-terminal"
-                    title={`${t("agents.openTerminal")}: ${agent.name}`}
-                    onClick={() => runAgent(agent)}
-                  >
-                    <TerminalIcon />
+      {railVisibility.agents && (
+        <div className="side-rail-agent" ref={agentsRef}>
+          <button
+            className={`side-rail-btn ${agentsOpen ? "active" : ""}`}
+            title={t("rail.runAgent")}
+            onClick={() => onAgentsOpenChange(!agentsOpen)}
+          >
+            <AgentIcon />
+          </button>
+          {agentsOpen && (
+            <div className="agent-menu" ref={menuRef}>
+              {agents.map((agent) => (
+                <div key={agent.id} className="agent-menu-entry">
+                  <button className="agent-menu-item" onClick={() => openAgent(agent)}>
+                    {agent.icon ? (
+                      <img className="agent-menu-icon" src={agent.icon} alt="" aria-hidden="true" />
+                    ) : (
+                      <span className="agent-menu-icon fallback">
+                        <AgentIcon />
+                      </span>
+                    )}
+                    <span>{agent.name}</span>
+                    {agent.runtime && <ChatIcon />}
                   </button>
-                )}
-              </div>
-            ))}
-            {agents.length === 0 && <div className="agent-menu-empty">{t("agents.noEnabled")}</div>}
-            <div className="agent-menu-separator" />
-            <button className="agent-menu-item agent-menu-settings" onClick={openAgentSettings}>
-              <GearIcon />
-              <span>{t("agents.settings")}</span>
-            </button>
-          </div>
-        )}
-      </div>
-      <button
-        className="side-rail-btn"
-        title={withShortcut(t("action.openAgentHistory"), "openAgentHistory")}
-        onClick={onOpenClaudeHistory}
-      >
-        <HistoryIcon />
-      </button>
-      <button
-        className="side-rail-btn"
-        title={withShortcut(t("action.openAgentUsage"), "openAgentUsage")}
-        onClick={onOpenAgentUsage}
-      >
-        <ChartIcon />
-      </button>
+                  {agent.runtime && agent.enabled && agentCommand(agent) && (
+                    <button
+                      className="agent-menu-terminal"
+                      title={`${t("agents.openTerminal")}: ${agent.name}`}
+                      onClick={() => runAgent(agent)}
+                    >
+                      <TerminalIcon />
+                    </button>
+                  )}
+                </div>
+              ))}
+              {agents.length === 0 && <div className="agent-menu-empty">{t("agents.noEnabled")}</div>}
+              <div className="agent-menu-separator" />
+              <button className="agent-menu-item agent-menu-settings" onClick={openAgentSettings}>
+                <GearIcon />
+                <span>{t("agents.settings")}</span>
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+      {DASHBOARD_RAIL_ITEMS.filter(({ view }) => railVisibility[view]).map(({ view, icon: Icon }) => (
+        <button
+          key={view}
+          className="side-rail-btn"
+          title={t("rail.newPane", { view: t(`pane.view.${view}`) })}
+          onClick={() => openPane(view)}
+        >
+          <Icon />
+        </button>
+      ))}
       <button
         className="side-rail-btn side-rail-settings"
         title={withShortcut(t("workspace.settings"), "openSettings")}

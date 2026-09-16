@@ -19,6 +19,10 @@ export interface AgentModelSetup {
 
 const SETUP: { match: RegExp; setup: AgentModelSetup }[] = [
   {
+    match: /\bgrok\b/i,
+    setup: { configPath: "~/.grok/config.toml", loginCommand: "grok login" },
+  },
+  {
     match: /\bopencode\b/i,
     setup: { configPath: "~/.config/opencode/opencode.jsonc", loginCommand: "opencode auth login" },
   },
